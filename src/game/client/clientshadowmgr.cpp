@@ -1976,10 +1976,7 @@ void CClientShadowMgr::UpdateFlashlightState( ClientShadowHandle_t shadowHandle,
 	if ( shadow.m_bOrtho )
 	{
 		// Orthographic projection (sunlight): same view matrix as the perspective
-		// path, but concatenated with an ortho projection. The identical
-		// MatrixBuildOrtho convention is used by the engine when it renders the
-		// depth pass from the CViewSetup ortho parameters, keeping the lighting
-		// pass and depth lookup consistent.
+		// path, but concatenated with an ortho projection.
 		VMatrix matWorldToShadowView, matOrtho;
 		BuildWorldToShadowMatrix( matWorldToShadowView, flashlightState.m_vecLightOrigin,
 								  flashlightState.m_quatOrientation );
@@ -1987,6 +1984,30 @@ void CClientShadowMgr::UpdateFlashlightState( ClientShadowHandle_t shadowHandle,
 						  shadow.m_flOrthoLeft, shadow.m_flOrthoTop,
 						  shadow.m_flOrthoRight, shadow.m_flOrthoBottom,
 						  flashlightState.m_NearZ, flashlightState.m_FarZ );
+
+		// The engine treats a flashlight's world-to-shadow matrix as mapping into
+		// a [0,1]^3 texture volume, not [-1,1] clip space: the AABB/frustum
+		// helpers enumerate 0..1 corners and the projected-texture lookup expects
+		// 0..1 coords. MatrixBuildPerspective bakes exactly this remap into its
+		// result (negate X/Y, add W, scale by half); MatrixBuildOrtho does not,
+		// so apply the identical post-transform here. Without it, the cookie and
+		// depth lookups land outside 0..1 and the sunlight pass is invisible.
+		VMatrix matNegateXY, matAddW, matScaleHalf;
+		matNegateXY.Identity();
+		matNegateXY[0][0] = -1.0f;
+		matNegateXY[1][1] = -1.0f;
+		MatrixMultiply( matNegateXY, matOrtho, matOrtho );
+
+		matAddW.Identity();
+		matAddW[0][3] = 1.0f;
+		matAddW[1][3] = 1.0f;
+		MatrixMultiply( matAddW, matOrtho, matOrtho );
+
+		matScaleHalf.Identity();
+		matScaleHalf[0][0] = 0.5f;
+		matScaleHalf[1][1] = 0.5f;
+		MatrixMultiply( matScaleHalf, matOrtho, matOrtho );
+
 		MatrixMultiply( matOrtho, matWorldToShadowView, shadow.m_WorldToShadow );
 	}
 	else
