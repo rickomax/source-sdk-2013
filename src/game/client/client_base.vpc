@@ -70,6 +70,17 @@ $Configuration
 		$IgnoreImportLibrary			"TRUE"
 		$AdditionalDependencies			"$BASE winmm.lib"	[$WIN32]
 		$AdditionalDependencies			"$BASE wsock32.lib Ws2_32.lib" [$BUILD_REPLAY]
+
+		// The prebuilt particles.lib and dmxloader.lib (no source ships in the SDK)
+		// were compiled against the pre-Universal-CRT (VS 2013) runtime. Linking them
+		// into a VS 2026 (UCRT) build needs two shims:
+		//  - legacy_stdio_definitions.lib supplies the old stdio symbols (e.g.
+		//    sscanf_s) that dmxloader.lib references but the UCRT now only inlines.
+		//  - /FORCE:MULTIPLE lets the link accept the duplicate _hypot that
+		//    particles.lib carries from the old static CRT (identical ABI to the
+		//    UCRT's). This is scoped to this DLL only.
+		$AdditionalDependencies			"$BASE legacy_stdio_definitions.lib" [$WIN32||$WIN64]
+		$AdditionalOptions				"$BASE /FORCE:MULTIPLE" [$WIN32||$WIN64]
 	}
 }
 
