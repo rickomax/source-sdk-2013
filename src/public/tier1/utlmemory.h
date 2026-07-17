@@ -331,6 +331,10 @@ public:
 	{
 #ifdef REMEMBER_ALLOC_SIZE_FOR_VALGRIND
 		return m_nCurAllocSize;
+#elif defined( NO_MALLOC_OVERRIDE )
+		// No g_pMemAlloc in this configuration; this buffer is realloc()'d, so
+		// query its size with the standard CRT.
+		return ( m_pMemory ) ? _msize( m_pMemory ) : 0;
 #else
 		return ( m_pMemory ) ? g_pMemAlloc->GetSize( m_pMemory ) : 0;
 #endif

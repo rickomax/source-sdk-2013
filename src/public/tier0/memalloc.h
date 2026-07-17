@@ -547,6 +547,28 @@ inline void MemAlloc_GlobalMemoryStatus( size_t *pusedMemory, size_t *pfreeMemor
 #define MemAlloc_RegisterExternalAllocation( tag, p, size ) ((void)0)
 #define MemAlloc_RegisterExternalDeallocation( tag, p, size ) ((void)0)
 
+// With NO_MALLOC_OVERRIDE there is no g_pMemAlloc, so the allocation helpers
+// that the rest of the codebase expects (MemAlloc_Alloc/Free and the aligned
+// family) are not otherwise defined. Provide them here on top of the standard
+// CRT allocator. Aligned allocations use _aligned_malloc/_aligned_realloc/
+// _aligned_free, which must always be paired with each other.
+#if defined( _WIN32 )
+#include <malloc.h>
+
+inline void *MemAlloc_Alloc( size_t nSize )										{ return malloc( nSize ); }
+inline void *MemAlloc_Alloc( size_t nSize, const char *pFileName, int nLine )	{ return malloc( nSize ); }
+inline void MemAlloc_Free( void *ptr )											{ free( ptr ); }
+inline void MemAlloc_Free( void *ptr, const char *pFileName, int nLine )		{ free( ptr ); }
+
+inline void *MemAlloc_AllocAligned( size_t size, size_t align )									{ return _aligned_malloc( size, align ); }
+inline void *MemAlloc_AllocAligned( size_t size, size_t align, const char *pszFile, int nLine )	{ return _aligned_malloc( size, align ); }
+inline void *MemAlloc_AllocAlignedUnattributed( size_t size, size_t align )						{ return _aligned_malloc( size, align ); }
+inline void *MemAlloc_AllocAlignedFileLine( size_t size, size_t align, const char *pszFile = NULL, int nLine = 0 )	{ return _aligned_malloc( size, align ); }
+inline void *MemAlloc_ReallocAligned( void *ptr, size_t size, size_t align )						{ return _aligned_realloc( ptr, size, align ); }
+inline void MemAlloc_FreeAligned( void *pMemBlock )												{ _aligned_free( pMemBlock ); }
+inline void MemAlloc_FreeAligned( void *pMemBlock, const char *pszFile, int nLine )				{ _aligned_free( pMemBlock ); }
+#endif // _WIN32
+
 #endif // !STEAM && NO_MALLOC_OVERRIDE
 
 //-----------------------------------------------------------------------------
