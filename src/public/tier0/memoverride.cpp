@@ -36,6 +36,16 @@
 #ifdef NDEBUG
 #undef _DEBUG
 #endif
+
+// In release builds the Universal CRT (VS 2015+) maps the whole CRT debug-heap
+// API (_malloc_dbg, _CrtSetDbgFlag, _CrtSetDumpClient, ...) to macros, which
+// makes real overrides of those names unparseable -- and uncallable, since
+// call sites expand the same macros. So on the UCRT those overrides can only
+// exist in debug builds. Pre-UCRT toolsets keep the old behavior (the forced
+// _DEBUG crtdbg.h include above declared them as real functions everywhere).
+#if defined(_DEBUG) || _MSC_VER < 1900
+#define OVERRIDE_CRT_DEBUG_API 1
+#endif
 #elif POSIX
 #define __cdecl
 #endif
@@ -518,6 +528,8 @@ private:
 extern "C"
 {
 	
+#ifdef OVERRIDE_CRT_DEBUG_API
+
 void *__cdecl _nh_malloc_dbg( size_t nSize, int nFlag, int nBlockUse,
 								const char *pFileName, int nLine )
 {
@@ -584,6 +596,8 @@ size_t __cdecl _msize_dbg( void *pMem, int nBlockUse )
 	return 0;
 #endif
 }
+
+#endif // OVERRIDE_CRT_DEBUG_API
 
 
 #ifdef _WIN32
@@ -684,6 +698,8 @@ ALLOC_CALL void * __cdecl _aligned_offset_recalloc( void * memblock, size_t coun
 extern "C"
 {
 	
+#ifdef OVERRIDE_CRT_DEBUG_API
+
 int _CrtDumpMemoryLeaks(void)
 {
 	return 0;
@@ -825,6 +841,8 @@ int __cdecl _CrtDbgReport( int nRptType, const char * szFile,
 
 	return g_pMemAlloc->CrtDbgReport( nRptType, szFile, nLine, szModule, output );
 }
+
+#endif // OVERRIDE_CRT_DEBUG_API
 
 #if _MSC_VER >= 1400
 
@@ -994,6 +1012,8 @@ int __cdecl _CrtSetReportHook2( int mode, _CRT_REPORT_HOOK pfnNewHook )
 
 #endif  /* defined( _DEBUG ) || defined( USE_MEM_DEBUG ) */
 
+#ifdef OVERRIDE_CRT_DEBUG_API
+
 extern "C" int __crtDebugCheckCount = FALSE;
 
 extern "C" int __cdecl _CrtSetCheckCount( int fCheckCount )
@@ -1031,11 +1051,16 @@ _CRT_REPORT_HOOK __cdecl _CrtGetReportHook( void )
 	return NULL;
 }
 
+#endif // OVERRIDE_CRT_DEBUG_API
+
 #endif
+
+#ifdef OVERRIDE_CRT_DEBUG_API
 int __cdecl _CrtReportBlockType(const void * pUserData)
 {
 	return 0;
 }
+#endif
 
 
 } // end extern "C"
@@ -1057,6 +1082,9 @@ int __cdecl _CrtReportBlockType(const void * pUserData)
 
 extern "C"
 {
+
+#ifdef OVERRIDE_CRT_DEBUG_API
+
 size_t __crtDebugFillThreshold = 0;
 
 extern "C" void * __cdecl _heap_alloc_base (size_t size) {
@@ -1160,6 +1188,8 @@ size_t __cdecl _CrtSetDebugFillThreshold( size_t _NewDebugFillThreshold)
     return 0;
 }
 
+#endif // OVERRIDE_CRT_DEBUG_API
+
 //===========================================
 // NEW!!! 64-bit
 
@@ -1225,11 +1255,13 @@ _TSCHAR * __cdecl _ttempnam ( const _TSCHAR *dir, const _TSCHAR *pfx )
 }
 #endif
 
+#ifdef OVERRIDE_CRT_DEBUG_API
 wchar_t * __cdecl _wcsdup_dbg ( const wchar_t * string, int nBlockUse, const char * szFileName, int nLine )
 {
 	Assert(0);
 	return 0;
 }
+#endif
 
 wchar_t * __cdecl _wcsdup ( const wchar_t * string )
 {
