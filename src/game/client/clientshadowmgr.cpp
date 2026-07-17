@@ -99,6 +99,14 @@ ConVar r_flashlightdepthres( "r_flashlightdepthres", "512" );
 ConVar r_flashlightdepthres( "r_flashlightdepthres", "1024" );
 #endif
 
+// Resolution of the dedicated sun shadowmap depth texture (see c_sunlight_shadowmap.cpp).
+// Takes effect when depth textures are (re)initialized -- changing it mid-game triggers
+// a reallocation via the change callback below.
+static void SunShadowDepthResChanged( IConVar *pVar, const char *pOldValue, float flOldValue );
+ConVar r_sunshadow_depthres( "r_sunshadow_depthres", "2048", FCVAR_ARCHIVE,
+	"Resolution of the sun shadowmap depth texture. 0 disables the dedicated texture (the sun then competes with the flashlight for the shared pool).",
+	SunShadowDepthResChanged );
+
 ConVar r_threaded_client_shadow_manager( "r_threaded_client_shadow_manager", "0" );
 
 #ifdef _WIN32
@@ -723,6 +731,18 @@ public:
 	virtual ClientShadowHandle_t CreateFlashlight( const FlashlightState_t &lightState );
 	virtual void UpdateFlashlightState( ClientShadowHandle_t shadowHandle, const FlashlightState_t &lightState );
 	virtual void DestroyFlashlight( ClientShadowHandle_t shadowHandle );
+	virtual void SetFlashlightOrtho( ClientShadowHandle_t shadowHandle, bool bOrtho,
+		float flLeft, float flTop, float flRight, float flBottom );
+
+	// Reallocates the depth textures (e.g. after r_sunshadow_depthres changes).
+	// Safe no-op if depth texturing hasn't been initialized yet.
+	void ReallocateDepthTextures()
+	{
+		if ( !m_bDepthTextureActive )
+			return;
+		ShutdownDepthTextureShadows();
+		InitDepthTextureShadows();
+	}
 
 	// Update a shadow
 	virtual void UpdateProjectedTexture( ClientShadowHandle_t handle, bool force );
@@ -817,6 +837,14 @@ private:
 		CTextureReference		m_ShadowDepthTexture;
 		int						m_nRenderFrame;
 		EHANDLE					m_hTargetEntity;
+
+		// Orthographic projection state for flashlights (sunlight shadows).
+		// Client-side only; see IClientShadowMgr::SetFlashlightOrtho.
+		bool					m_bOrtho;
+		float					m_flOrthoLeft;
+		float					m_flOrthoTop;
+		float					m_flOrthoRight;
+		float					m_flOrthoBottom;
 	};
 
 private:
@@ -951,6 +979,14 @@ private:
 	CMaterialReference m_RenderShadow;
 	CMaterialReference m_RenderModelShadow;
 	CTextureReference m_DummyColorTexture;
+
+	// Dedicated depth texture for the orthographic sun shadow. The regular pool
+	// holds a single depth texture on PC, which the player's flashlight needs;
+	// the sun also wants its own (usually higher) resolution, set by
+	// r_sunshadow_depthres.
+	CTextureReference m_SunShadowDepthTexture;
+	CTextureReference m_SunShadowDummyColorTexture;
+
 	CUtlLinkedList< ClientShadow_t, ClientShadowHandle_t >	m_Shadows;
 	CTextureAllocator m_ShadowAllocator;
 
@@ -981,6 +1017,18 @@ private:
 //-----------------------------------------------------------------------------
 static CClientShadowMgr s_ClientShadowMgr;
 IClientShadowMgr* g_pClientShadowMgr = &s_ClientShadowMgr;
+
+//-----------------------------------------------------------------------------
+// Reallocate the depth textures when the sun shadowmap resolution changes so
+// the new resolution applies without a restart.
+//-----------------------------------------------------------------------------
+static void SunShadowDepthResChanged( IConVar *pVar, const char *pOldValue, float flOldValue )
+{
+	if ( r_sunshadow_depthres.GetInt() == (int)flOldValue )
+		return;
+
+	s_ClientShadowMgr.ReallocateDepthTextures();
+}
 
 
 //-----------------------------------------------------------------------------
@@ -1386,6 +1434,23 @@ void CClientShadowMgr::InitDepthTextureShadows()
 			m_DepthTextureCacheLocks.AddToTail( bFalse );
 		}
 
+		// Dedicated depth texture for the orthographic sun shadow, at its own
+		// resolution. The PC pool above only has one entry, which the player's
+		// flashlight uses; without this, sun + flashlight couldn't shadow at once.
+		int nSunRes = r_sunshadow_depthres.GetInt();
+		if ( nSunRes > 0 )
+		{
+#if defined( _X360 )
+			m_SunShadowDummyColorTexture.InitRenderTargetTexture( nSunRes, nSunRes, RT_SIZE_OFFSCREEN, IMAGE_FORMAT_BGR565, MATERIAL_RT_DEPTH_SHARED, false, "_rt_SunShadowDummy" );
+			m_SunShadowDummyColorTexture.InitRenderTargetSurface( nSunRes, nSunRes, IMAGE_FORMAT_BGR565, true );
+			m_SunShadowDepthTexture.InitRenderTargetTexture( nSunRes, nSunRes, RT_SIZE_OFFSCREEN, dstFormat, MATERIAL_RT_DEPTH_NONE, false, "_rt_SunShadowDepth" );
+			m_SunShadowDepthTexture.InitRenderTargetSurface( 1, 1, dstFormat, false );
+#else
+			m_SunShadowDummyColorTexture.InitRenderTarget( nSunRes, nSunRes, RT_SIZE_OFFSCREEN, nullFormat, MATERIAL_RT_DEPTH_NONE, false, "_rt_SunShadowDummy" );
+			m_SunShadowDepthTexture.InitRenderTarget( nSunRes, nSunRes, RT_SIZE_OFFSCREEN, dstFormat, MATERIAL_RT_DEPTH_NONE, false, "_rt_SunShadowDepth" );
+#endif
+		}
+
 		materials->EndRenderTargetAllocation();
 	}
 }
@@ -1396,6 +1461,9 @@ void CClientShadowMgr::ShutdownDepthTextureShadows()
 	{
 		// Shut down the dummy texture
 		m_DummyColorTexture.Shutdown();
+
+		m_SunShadowDepthTexture.Shutdown();
+		m_SunShadowDummyColorTexture.Shutdown();
 
 		while( m_DepthTextureCache.Count() )
 		{
@@ -1817,6 +1885,8 @@ ClientShadowHandle_t CClientShadowMgr::CreateProjectedTexture( ClientEntityHandl
 	shadow.m_nRenderFrame = -1;
 	shadow.m_LastOrigin.Init( FLT_MAX, FLT_MAX, FLT_MAX );
 	shadow.m_LastAngles.Init( FLT_MAX, FLT_MAX, FLT_MAX );
+	shadow.m_bOrtho = false;
+	shadow.m_flOrthoLeft = shadow.m_flOrthoTop = shadow.m_flOrthoRight = shadow.m_flOrthoBottom = 0.0f;
 	Assert( ( ( shadow.m_Flags & SHADOW_FLAGS_FLASHLIGHT ) == 0 ) != 
 			( ( shadow.m_Flags & SHADOW_FLAGS_SHADOW ) == 0 ) );
 
@@ -1902,14 +1972,52 @@ void CClientShadowMgr::UpdateFlashlightState( ClientShadowHandle_t shadowHandle,
 {
 	VPROF_BUDGET( "CClientShadowMgr::UpdateFlashlightState", VPROF_BUDGETGROUP_SHADOW_DEPTH_TEXTURING );
 
-	BuildPerspectiveWorldToFlashlightMatrix( m_Shadows[shadowHandle].m_WorldToShadow, flashlightState );
-											
-	shadowmgr->UpdateFlashlightState( m_Shadows[shadowHandle].m_ShadowHandle, flashlightState );
+	ClientShadow_t &shadow = m_Shadows[shadowHandle];
+	if ( shadow.m_bOrtho )
+	{
+		// Orthographic projection (sunlight): same view matrix as the perspective
+		// path, but concatenated with an ortho projection. The identical
+		// MatrixBuildOrtho convention is used by the engine when it renders the
+		// depth pass from the CViewSetup ortho parameters, keeping the lighting
+		// pass and depth lookup consistent.
+		VMatrix matWorldToShadowView, matOrtho;
+		BuildWorldToShadowMatrix( matWorldToShadowView, flashlightState.m_vecLightOrigin,
+								  flashlightState.m_quatOrientation );
+		MatrixBuildOrtho( matOrtho,
+						  shadow.m_flOrthoLeft, shadow.m_flOrthoTop,
+						  shadow.m_flOrthoRight, shadow.m_flOrthoBottom,
+						  flashlightState.m_NearZ, flashlightState.m_FarZ );
+		MatrixMultiply( matOrtho, matWorldToShadowView, shadow.m_WorldToShadow );
+	}
+	else
+	{
+		BuildPerspectiveWorldToFlashlightMatrix( shadow.m_WorldToShadow, flashlightState );
+	}
+
+	shadowmgr->UpdateFlashlightState( shadow.m_ShadowHandle, flashlightState );
 }
 
 void CClientShadowMgr::DestroyFlashlight( ClientShadowHandle_t shadowHandle )
 {
 	DestroyShadow( shadowHandle );
+}
+
+//-----------------------------------------------------------------------------
+// Marks a flashlight as orthographic (sunlight). Client-side only state; call
+// before UpdateFlashlightState so the next matrix build picks it up.
+//-----------------------------------------------------------------------------
+void CClientShadowMgr::SetFlashlightOrtho( ClientShadowHandle_t shadowHandle, bool bOrtho,
+	float flLeft, float flTop, float flRight, float flBottom )
+{
+	if ( shadowHandle == CLIENTSHADOW_INVALID_HANDLE )
+		return;
+
+	ClientShadow_t &shadow = m_Shadows[shadowHandle];
+	shadow.m_bOrtho = bOrtho;
+	shadow.m_flOrthoLeft = flLeft;
+	shadow.m_flOrthoTop = flTop;
+	shadow.m_flOrthoRight = flRight;
+	shadow.m_flOrthoBottom = flBottom;
 }
 
 //-----------------------------------------------------------------------------
@@ -3926,8 +4034,22 @@ void CClientShadowMgr::ComputeShadowDepthTextures( const CViewSetup &viewSetup )
 	{
 		ClientShadow_t& shadow = m_Shadows[ pActiveDepthShadows[j] ];
 
+		// The orthographic sun shadow uses its own dedicated depth texture so it
+		// doesn't fight the player's flashlight over the single pooled texture,
+		// and so it can run at its own resolution (r_sunshadow_depthres).
+		bool bUseSunDepthTexture = shadow.m_bOrtho && m_SunShadowDepthTexture.IsValid();
+
 		CTextureReference shadowDepthTexture;
-		bool bGotShadowDepthTexture = LockShadowDepthTexture( &shadowDepthTexture );
+		bool bGotShadowDepthTexture;
+		if ( bUseSunDepthTexture )
+		{
+			shadowDepthTexture.Init( m_SunShadowDepthTexture );
+			bGotShadowDepthTexture = true;
+		}
+		else
+		{
+			bGotShadowDepthTexture = LockShadowDepthTexture( &shadowDepthTexture );
+		}
 		if ( !bGotShadowDepthTexture )
 		{
 			// If we don't get one, that means we have too many this frame so bind no depth texture
@@ -3960,6 +4082,17 @@ void CClientShadowMgr::ComputeShadowDepthTextures( const CViewSetup &viewSetup )
 		shadowView.zNear = shadowView.zNearViewmodel = flashlightState.m_NearZ;
 		shadowView.zFar = shadowView.zFarViewmodel = flashlightState.m_FarZ;
 
+		// Orthographic (sunlight) shadows render the depth pass with the same
+		// ortho extents used to build the lighting-pass matrix.
+		if ( shadow.m_bOrtho )
+		{
+			shadowView.m_bOrtho = true;
+			shadowView.m_OrthoLeft = shadow.m_flOrthoLeft;
+			shadowView.m_OrthoTop = shadow.m_flOrthoTop;
+			shadowView.m_OrthoRight = shadow.m_flOrthoRight;
+			shadowView.m_OrthoBottom = shadow.m_flOrthoBottom;
+		}
+
 		// Can turn on all light frustum overlays or per light with flashlightState parameter...
 		if ( bDebugFrustum || flashlightState.m_bDrawShadowFrustum )
 		{
@@ -3971,7 +4104,7 @@ void CClientShadowMgr::ComputeShadowDepthTextures( const CViewSetup &viewSetup )
 		pRenderContext->SetShadowDepthBiasFactors( flashlightState.m_flShadowSlopeScaleDepthBias, flashlightState.m_flShadowDepthBias );
 
 		// Render to the shadow depth texture with appropriate view
-		view->UpdateShadowDepthTexture( m_DummyColorTexture, shadowDepthTexture, shadowView );
+		view->UpdateShadowDepthTexture( bUseSunDepthTexture ? m_SunShadowDummyColorTexture : m_DummyColorTexture, shadowDepthTexture, shadowView );
 
 		// Associate the shadow depth texture and stencil bit with the flashlight for use during scene rendering
 		shadowmgr->SetFlashlightDepthTexture( shadow.m_ShadowHandle, shadowDepthTexture, 0 );

@@ -286,6 +286,7 @@ $Project
 		$File	"c_sprite.cpp"
 		$File	"c_sprite_perfmonitor.cpp"
 		$File	"c_sun.cpp"
+		$File	"c_sunlight_shadowmap.cpp"
 		$File	"c_team.cpp"
 		$File	"c_tesla.cpp"
 		$File	"c_test_proxytoggle.cpp"

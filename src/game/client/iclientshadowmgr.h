@@ -51,6 +51,16 @@ public:
 	virtual ClientShadowHandle_t CreateFlashlight( const FlashlightState_t &lightState ) = 0;
 	virtual void UpdateFlashlightState( ClientShadowHandle_t shadowHandle, const FlashlightState_t &lightState ) = 0;
 	virtual void DestroyFlashlight( ClientShadowHandle_t handle ) = 0;
+
+	// Marks a flashlight as using an orthographic projection (e.g. sunlight).
+	// This is tracked entirely on the client side -- FlashlightState_t is shared
+	// with the prebuilt engine binaries and must not change layout, and both the
+	// lighting-pass matrix and the shadow depth view are built in client code, so
+	// the engine never needs to know about the projection type.
+	// Call before UpdateFlashlightState; extents are view-space (left/top/right/
+	// bottom, matching MatrixBuildOrtho and CViewSetup ortho semantics).
+	virtual void SetFlashlightOrtho( ClientShadowHandle_t shadowHandle, bool bOrtho,
+		float flLeft, float flTop, float flRight, float flBottom ) = 0;
 	
 	// Indicate that the shadow should be recomputed due to a change in
 	// the client entity
