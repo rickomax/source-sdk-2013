@@ -54,6 +54,16 @@ $Configuration
 		$PreprocessorDefinitions			"$BASE;PLATFORM_64BITS;WIN64;_WIN64;COMPILER_MSVC64" [$WIN64]
 		$PreprocessorDefinitions			"$BASE;COMPILER_MSVC32" [$WIN32]
 
+		// The CRT allocator override in public/tier0/memoverride.cpp re-implements
+		// internal CRT functions (_calloc_base, _recalloc_base, _msize_base, the
+		// debug-heap and locale internals, ...) using pre-Universal-CRT signatures.
+		// The Universal CRT (VS 2015+, and thus VS 2026 / v145) changed or removed
+		// all of them, so the override no longer compiles. Defining NO_MALLOC_OVERRIDE
+		// selects the standard-allocator configuration that memalloc.h already
+		// supports (the same one STEAM builds use): memoverride.cpp compiles out and
+		// the mod modules use the Universal CRT allocator directly.
+		$PreprocessorDefinitions			"$BASE;NO_MALLOC_OVERRIDE"
+
 		// /Gw is a VS 2013 option that puts global and static variables in individual sections so that the
 		// linker can discard unreferenced data. When building @client /dota with linker optimizations this
 		// reduces the client.dll size by about 1.14%. When linker optimizations are disabled this has no
