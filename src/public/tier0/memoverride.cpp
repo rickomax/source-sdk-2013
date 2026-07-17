@@ -109,8 +109,16 @@ inline void *ReallocUnattributed( void *pMem, size_t nSize )
 // under linux this malloc() overrides the libc malloc() and so we
 // end up in a recursion (as g_pMemAlloc->Alloc() calls malloc)
 #if _MSC_VER >= 1400
-#define ALLOC_CALL _CRTNOALIAS _CRTRESTRICT 
-#define FREE_CALL _CRTNOALIAS 
+// The Universal CRT (VS 2015+) removed these annotation macros from the
+// headers; define them away so the overrides below compile on both CRTs.
+#ifndef _CRTNOALIAS
+#define _CRTNOALIAS
+#endif
+#ifndef _CRTRESTRICT
+#define _CRTRESTRICT
+#endif
+#define ALLOC_CALL _CRTNOALIAS _CRTRESTRICT
+#define FREE_CALL _CRTNOALIAS
 #else
 #define ALLOC_CALL
 #define FREE_CALL
@@ -162,6 +170,40 @@ void *_malloc_base( size_t nSize )
 }
 #endif
 
+#if _MSC_VER >= 1900
+// Universal CRT signatures. Overriding the *_base internals as well as the
+// public functions keeps CRT-internal allocations (e.g. strdup) on the same
+// allocator as everything else.
+void *__cdecl _calloc_base( size_t nCount, size_t nSize )
+{
+	void *pMem = AllocUnattributed( nCount * nSize );
+	memset(pMem, 0, nCount * nSize);
+	return pMem;
+}
+
+void *__cdecl _realloc_base( void *pMem, size_t nSize )
+{
+	return ReallocUnattributed( pMem, nSize );
+}
+
+void *__cdecl _recalloc_base( void *pMem, size_t nCount, size_t nSize )
+{
+	void *pMemOut = ReallocUnattributed( pMem, nCount * nSize );
+	memset(pMemOut, 0, nCount * nSize);
+	return pMemOut;
+}
+
+void __cdecl _free_base( void *pMem )
+{
+	g_pMemAlloc->Free(pMem);
+}
+
+void *__cdecl _expand_base( void *pMem, size_t nNewSize )
+{
+	Assert( 0 );
+	return NULL;
+}
+#else
 void *_calloc_base( size_t nSize )
 {
 	void *pMem = AllocUnattributed( nSize );
@@ -192,7 +234,7 @@ void *__cdecl _expand_base( void *pMem, size_t nNewSize, int nBlockUse )
 	return NULL;
 }
 
-// crt
+// crt (pre-UCRT internal entry points; gone from VS 2015+)
 void * __cdecl _malloc_crt(size_t size)
 {
 	return AllocUnattributed( size );
@@ -212,6 +254,7 @@ void * __cdecl _recalloc_crt(void *ptr, size_t count, size_t size)
 {
 	return _recalloc_base( ptr, size * count );
 }
+#endif // _MSC_VER >= 1900
 
 ALLOC_CALL void * __cdecl _recalloc ( void * memblock, size_t count, size_t size )
 {
@@ -220,10 +263,22 @@ ALLOC_CALL void * __cdecl _recalloc ( void * memblock, size_t count, size_t size
 	return pMem;
 }
 
+#if _MSC_VER >= 1900
+// The UCRT declares _msize_base with a non-throwing exception specification;
+// the definition must match it exactly.
+#ifndef _CRT_NOEXCEPT
+#define _CRT_NOEXCEPT noexcept
+#endif
+size_t __cdecl _msize_base( void *pMem ) _CRT_NOEXCEPT
+{
+	return g_pMemAlloc->GetSize(pMem);
+}
+#else
 size_t _msize_base( void *pMem )
 {
 	return g_pMemAlloc->GetSize(pMem);
 }
+#endif
 
 size_t _msize( void *pMem )
 {
@@ -400,6 +455,21 @@ void __cdecl operator delete[]( void *pMem )
 {
 	g_pMemAlloc->Free( pMem );
 }
+
+#if defined( _MSC_VER ) && _MSC_VER >= 1900
+// C++14 sized deallocation: modern compilers emit calls to these for plain
+// `delete`. Without these overrides the sized forms in the CRT would free our
+// g_pMemAlloc-owned pointers on the CRT heap and corrupt/assert.
+void __cdecl operator delete( void *pMem, size_t nSize ) noexcept
+{
+	g_pMemAlloc->Free( pMem );
+}
+
+void __cdecl operator delete[]( void *pMem, size_t nSize ) noexcept
+{
+	g_pMemAlloc->Free( pMem );
+}
+#endif
 #endif
 
 
@@ -633,6 +703,10 @@ int _CrtSetDbgFlag( int nNewFlag )
 #define AFNAME(var) __p_ ## var
 #define AFRET(var)  &var
 
+#if _MSC_VER < 1900
+// In the UCRT, _crtDbgFlag/_crtBreakAlloc are macros over __p_* accessor
+// functions that the CRT itself provides, so these overrides only apply to
+// the pre-2015 CRTs.
 int _crtDbgFlag = _CRTDBG_ALLOC_MEM_DF;
 int* AFNAME(_crtDbgFlag)(void)
 {
@@ -644,6 +718,7 @@ long* AFNAME(_crtBreakAlloc) (void)
 {
 	return AFRET(_crtBreakAlloc);
 }
+#endif
 
 void __cdecl _CrtSetDbgBlockType( void *pMem, int nBlockUse )
 {
@@ -863,9 +938,10 @@ ErrorHandlerRegistrar::ErrorHandlerRegistrar()
 	_set_invalid_parameter_handler( VInvalidParameterHandler );
 }
 
-#if defined( _DEBUG )
- 
+#if defined( _DEBUG ) && _MSC_VER < 1900
+
 // wrapper which passes no debug info; not available in debug
+// (the UCRT provides its own definition)
 #ifndef	SUPPRESS_INVALID_PARAMETER_NO_INFO
 void __cdecl _invalid_parameter_noinfo(void)
 {
@@ -898,12 +974,16 @@ int __cdecl _CrtDbgReportW( int nRptType, const wchar_t *szFile, int nLine,
 	return 0;
 }
 
-int __cdecl _VCrtDbgReportA( int nRptType, const wchar_t * szFile, int nLine, 
+#if _MSC_VER < 1900
+// The UCRT declares _VCrtDbgReportA with a different signature and provides
+// its own definition.
+int __cdecl _VCrtDbgReportA( int nRptType, const wchar_t * szFile, int nLine,
 							 const wchar_t * szModule, const wchar_t * szFormat, va_list arglist )
 {
 	Assert(0);
 	return 0;
 }
+#endif
 
 int __cdecl _CrtSetReportHook2( int mode, _CRT_REPORT_HOOK pfnNewHook )
 {
@@ -1306,6 +1386,13 @@ SIZE_T WINAPI XMemSize( PVOID pAddress, DWORD dwAllocAttributes )
 }
 #endif // _X360
 
+#if _MSC_VER < 1900
+// Everything below reconstructs pre-Universal-CRT internals (per-thread data,
+// locale structures, the CRT startup namespace) so the old static CRT's debug
+// heap objects don't get pulled into the link. The UCRT reorganized all of it
+// (pthreadmbcinfo/pthreadlocinfo et al no longer exist) and no longer needs
+// the workaround, so it compiles only for the old toolsets.
+
 #define MAX_LANG_LEN        64  /* max language name length */
 #define MAX_CTRY_LEN        64  /* max country name length */
 #define MAX_MODIFIER_LEN    0   /* max modifier name length - n/a */
@@ -1650,6 +1737,8 @@ namespace _NATIVE_STARTUP_NAMESPACE
     };
 }
 #pragma warning(pop)
+
+#endif // _MSC_VER < 1900
 
 #endif // _MSC_VER >= 1400
 
