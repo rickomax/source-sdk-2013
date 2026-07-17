@@ -3,8 +3,19 @@ setlocal
 
 rem Use dynamic shaders to build .inc files only
 rem set dynamic_shaders=1
-rem == Setup path to nmake.exe, from vc 2005 common tools directory ==
-call "%VS100COMNTOOLS%vsvars32.bat"
+
+rem == Set up the Visual Studio 2026 build environment (nmake.exe, etc.) ==
+rem The legacy VSxxxCOMNTOOLS environment variables were removed after VS 2015,
+rem so locate the installation with vswhere and call VsDevCmd.bat instead.
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" set "VSWHERE=%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"
+set "VSINSTALLPATH="
+for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALLPATH=%%i"
+if not defined VSINSTALLPATH (
+	echo ERROR: Could not locate a Visual Studio installation with the C++ toolset.
+	exit /b 1
+)
+call "%VSINSTALLPATH%\Common7\Tools\VsDevCmd.bat" -arch=x86 -no_logo
 
 
 set TTEXE=..\..\devtools\bin\timeprecise.exe

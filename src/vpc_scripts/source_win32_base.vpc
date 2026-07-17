@@ -8,10 +8,15 @@ $Configuration
 	$General
 	{
 		// Request a specific compiler toolset.
+		// VPC's project generator emits the VS 2010 (.vcxproj) file format and, by
+		// default (the /2013 generator flag), sets $VS2013. We map that default
+		// generation onto the Visual Studio 2026 (MSVC v14.50) "v145" toolset so the
+		// projects build with MSVC 2026. v145 has no Windows XP-targeting ("_xp")
+		// variant, so a single toolset covers both normal and /analyze builds.
 		$PlatformToolset "v110_xp" [$VS2012 && !$ANALYZE] // VS 2012 targeting Windows XP - http://msdn.microsoft.com/en-us/library/vstudio/jj851139.aspx
 		$PlatformToolset "v110" [$VS2012 && $ANALYZE] // VS 2012 for /analyze
-		$PlatformToolset "v120_xp" [$VS2013 && !$ANALYZE] // VS 2013 targeting Windows XP - http://msdn.microsoft.com/en-us/library/vstudio/jj851139.aspx
-		$PlatformToolset "v120" [$VS2013 && $ANALYZE] // VS 2013 for /analyze
+		$PlatformToolset "v145" [$VS2013 && !$ANALYZE] // Visual Studio 2026 (MSVC v14.50)
+		$PlatformToolset "v145" [$VS2013 && $ANALYZE] // Visual Studio 2026 (MSVC v14.50) for /analyze
 	}
 
 	$General

@@ -4,7 +4,17 @@ setlocal
 @rem Move to the batch file directory so we can run it from anywhere
 cd %~dp0
 
-call "%VS110COMNTOOLS%vsvars32.bat"
+@rem Locate Visual Studio 2026 with vswhere (the legacy VSxxxCOMNTOOLS
+@rem environment variables were removed after VS 2015) and set up its tools.
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" set "VSWHERE=%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"
+set "VSINSTALLPATH="
+for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALLPATH=%%i"
+if not defined VSINSTALLPATH (
+	echo ERROR: Could not locate a Visual Studio installation with the C++ toolset.
+	exit /b 1
+)
+call "%VSINSTALLPATH%\Common7\Tools\VsDevCmd.bat" -no_logo
 set dirsuffix=\2012
 
 @rem Note that we no longer build separate debug libraries
