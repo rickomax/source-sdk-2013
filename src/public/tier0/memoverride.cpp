@@ -78,6 +78,22 @@ const char *MakeModuleFileName()
 	return NULL;
 }
 
+#if _MSC_VER >= 1900
+// Under the Universal CRT our overridden _malloc_base/_calloc_base run during
+// early CRT startup -- before the C++11 thread-safe-static ("magic static")
+// guard machinery is initialized. The function-local statics the old versions
+// used to cache the module name would touch that machinery on the very first
+// allocation and take down DLL initialization, so these must stay static-free.
+static void *AllocUnattributed( size_t nSize )
+{
+	return g_pMemAlloc->Alloc(nSize);
+}
+
+static void *ReallocUnattributed( void *pMem, size_t nSize )
+{
+	return g_pMemAlloc->Realloc(pMem, nSize);
+}
+#else
 static void *AllocUnattributed( size_t nSize )
 {
 	static const char *pszOwner = MakeModuleFileName();
@@ -97,6 +113,7 @@ static void *ReallocUnattributed( void *pMem, size_t nSize )
 	else
 		return g_pMemAlloc->Realloc(pMem, nSize, pszOwner, 0);
 }
+#endif
 
 #else
 #define MakeModuleFileName() NULL
@@ -198,8 +215,16 @@ void *__cdecl _realloc_base( void *pMem, size_t nSize )
 
 void *__cdecl _recalloc_base( void *pMem, size_t nCount, size_t nSize )
 {
-	void *pMemOut = ReallocUnattributed( pMem, nCount * nSize );
-	memset(pMemOut, 0, nCount * nSize);
+	// recalloc semantics: preserve existing contents, zero only the newly
+	// grown tail. The UCRT calls this internally during startup (environment
+	// block growth among others); wiping the whole block corrupts CRT state.
+	size_t nBytes = nCount * nSize;
+	size_t nOldBytes = pMem ? g_pMemAlloc->GetSize( pMem ) : 0;
+	void *pMemOut = ReallocUnattributed( pMem, nBytes );
+	if ( pMemOut && nBytes > nOldBytes )
+	{
+		memset( (char *)pMemOut + nOldBytes, 0, nBytes - nOldBytes );
+	}
 	return pMemOut;
 }
 
@@ -268,9 +293,19 @@ void * __cdecl _recalloc_crt(void *ptr, size_t count, size_t size)
 
 ALLOC_CALL void * __cdecl _recalloc ( void * memblock, size_t count, size_t size )
 {
-	void *pMem = ReallocUnattributed( memblock, size * count );
-	memset( pMem, 0, size * count );
+#if _MSC_VER >= 1900
+	return _recalloc_base( memblock, count, size );
+#else
+	// recalloc semantics: preserve existing contents, zero only the grown tail.
+	size_t nBytes = size * count;
+	size_t nOldBytes = memblock ? g_pMemAlloc->GetSize( memblock ) : 0;
+	void *pMem = ReallocUnattributed( memblock, nBytes );
+	if ( pMem && nBytes > nOldBytes )
+	{
+		memset( (char *)pMem + nOldBytes, 0, nBytes - nOldBytes );
+	}
 	return pMem;
+#endif
 }
 
 #if _MSC_VER >= 1900
@@ -602,7 +637,10 @@ size_t __cdecl _msize_dbg( void *pMem, int nBlockUse )
 
 #ifdef _WIN32
 
-#if defined(_DEBUG) && _MSC_VER >= 1300
+// On the Universal CRT this is enabled in release too: CUtlMemoryAligned and
+// friends mix _aligned_malloc with MemAlloc_ReallocAligned/MemAlloc_FreeAligned,
+// so all of them must ride the same allocator.
+#if ( defined(_DEBUG) || _MSC_VER >= 1900 ) && _MSC_VER >= 1300
 // X360TBD: aligned and offset allocations may be important on the 360
 
 // aligned base
@@ -1030,20 +1068,22 @@ extern "C" int __cdecl _CrtGetCheckCount( void )
 // aligned offset debug
 extern "C" void * __cdecl _aligned_offset_recalloc_dbg( void * memblock, size_t count, size_t size, size_t align, size_t offset, const char * f_name, int line_n )
 {
-	Assert( IsPC() || 0 );
-	void *pMem = ReallocUnattributed( memblock, size * count );
-	memset( pMem, 0, size * count );
-	return pMem;
+	// Never supported by this allocator; the old fallback silently wiped the
+	// block's preserved contents with a plain (unaligned!) realloc + memset.
+	Assert( 0 );
+	return NULL;
 }
 
 extern "C" void * __cdecl _aligned_recalloc_dbg( void *memblock, size_t count, size_t size, size_t align, const char * f_name, int line_n )
 {
-    return _aligned_offset_recalloc_dbg(memblock, count, size, align, 0, f_name, line_n);
+	// Preserves contents; the newly grown tail is not zeroed (old size isn't
+	// tracked for aligned blocks), which beats destroying the existing data.
+	return MemAlloc_ReallocAligned( memblock, count * size, align );
 }
 
 extern "C" void * __cdecl _recalloc_dbg ( void * memblock, size_t count, size_t size, int nBlockUse, const char * szFileName, int nLine )
 {
-	return _aligned_offset_recalloc_dbg(memblock, count, size, 0, 0, szFileName, nLine);
+	return _recalloc( memblock, count, size );
 }
 
 _CRT_REPORT_HOOK __cdecl _CrtGetReportHook( void )
@@ -1193,6 +1233,10 @@ size_t __cdecl _CrtSetDebugFillThreshold( size_t _NewDebugFillThreshold)
 //===========================================
 // NEW!!! 64-bit
 
+// The Universal CRT's own _strdup/_wcsdup allocate through _malloc_base,
+// which is overridden above, so they already land on the shared allocator;
+// overriding the functions themselves is only needed on pre-2015 CRTs.
+#if _MSC_VER < 1900
 char * __cdecl _strdup ( const char * string )
 {
 	int nSize = (int)strlen(string) + 1;
@@ -1204,6 +1248,7 @@ char * __cdecl _strdup ( const char * string )
 		memcpy( pCopy, string, nSize );
 	return pCopy;
 }
+#endif
 
 #if 0
 _TSCHAR * __cdecl _tfullpath_dbg ( _TSCHAR *UserBuf, const _TSCHAR *path, size_t maxlen, int nBlockUse, const char * szFileName, int nLine )
@@ -1263,11 +1308,13 @@ wchar_t * __cdecl _wcsdup_dbg ( const wchar_t * string, int nBlockUse, const cha
 }
 #endif
 
+#if _MSC_VER < 1900
 wchar_t * __cdecl _wcsdup ( const wchar_t * string )
 {
 	Assert(0);
 	return 0;
 }
+#endif
 
 } // end extern "C"
 
