@@ -1985,6 +1985,14 @@ void CClientShadowMgr::UpdateFlashlightState( ClientShadowHandle_t shadowHandle,
 						  shadow.m_flOrthoRight, shadow.m_flOrthoBottom,
 						  flashlightState.m_NearZ, flashlightState.m_FarZ );
 
+		// MatrixBuildOrtho is right-handed (looks down -z, per its
+		// D3DXMatrixOrthoOffCenterRH heritage), but the flashlight shadow-view
+		// matrix from BuildWorldToShadowMatrix has +z forward -- which is why
+		// MatrixBuildPerspective's raw matrix uses w = +z. Flip the ortho z axis
+		// to match; otherwise the volume maps behind the light and the whole
+		// shadow gets frustum-culled every frame.
+		matOrtho[2][2] = -matOrtho[2][2];
+
 		// The engine treats a flashlight's world-to-shadow matrix as mapping into
 		// a [0,1]^3 texture volume, not [-1,1] clip space: the AABB/frustum
 		// helpers enumerate 0..1 corners and the projected-texture lookup expects
