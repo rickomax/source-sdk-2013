@@ -43,7 +43,12 @@ $Configuration
 		// window since F8 stops on both warnings and errors. The only way to
 		// keep the warning count down is to have warnings-as-errors.
 		// We will not be warning free on 64-bit for a while...
-		$TreatWarningsAsErrors				"Yes (/WX)" [!$ANALYZE && !$WIN64]
+		//
+		// Disabled for the MSVC 2026 (v145) toolset: moving from VS 2013 (v120)
+		// surfaces many new compiler warnings across this legacy codebase, and
+		// /WX would turn every one into a hard build error. Re-enable this once
+		// the new warnings have been triaged and cleaned up.
+		$TreatWarningsAsErrors				"No" [!$ANALYZE && !$WIN64]
 
 		// Defines to differentiate 32 from 64 bit builds
 		$PreprocessorDefinitions			"$BASE;PLATFORM_64BITS;WIN64;_WIN64;COMPILER_MSVC64" [$WIN64]
