@@ -37,13 +37,20 @@
 #undef _DEBUG
 #endif
 
-// In release builds the Universal CRT (VS 2015+) maps the whole CRT debug-heap
-// API (_malloc_dbg, _CrtSetDbgFlag, _CrtSetDumpClient, ...) to macros, which
-// makes real overrides of those names unparseable -- and uncallable, since
-// call sites expand the same macros. So on the UCRT those overrides can only
-// exist in debug builds. Pre-UCRT toolsets keep the old behavior (the forced
-// _DEBUG crtdbg.h include above declared them as real functions everywhere).
-#if defined(_DEBUG) || _MSC_VER < 1900
+// The whole CRT debug-heap API (_malloc_dbg, _CrtSetDbgFlag, _CrtSetDumpClient,
+// _CrtSetDebugFillThreshold, ...) must NOT be overridden on the Universal CRT
+// (VS 2015+):
+//   - In release the UCRT maps those names to macros, so real definitions of
+//     them fail to parse (and would be uncallable, since call sites expand the
+//     same macros).
+//   - In debug they are real symbols the UCRT itself defines and exports, so
+//     redefining them multiply-defines the symbol at link time (e.g.
+//     _CrtSetDebugFillThreshold already defined in memoverride.obj).
+// On the UCRT these entry points route their actual allocations through
+// _malloc_base / _free_base, which we DO override, so the allocator is still
+// ours without touching this layer. Only the pre-2015 CRTs, whose debug heap
+// we had to replace wholesale, need these overrides.
+#if _MSC_VER < 1900
 #define OVERRIDE_CRT_DEBUG_API 1
 #endif
 #elif POSIX
