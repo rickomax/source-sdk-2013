@@ -2089,6 +2089,13 @@ bool RadWorld_Go()
 		Msg("FinalLightFace Done\n"); fflush(stdout);
 	}
 
+	// Bake the sun shadowmask sidecar (opt-in via -sunshadowmask). The ray-trace
+	// environment and the sun light are both live here; only the master needs it.
+	if ( !g_bUseMPI || g_bMPIMaster )
+	{
+		BuildSunShadowMask();
+	}
+
 	return true;
 }
 
@@ -2379,6 +2386,17 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 		else if ( !Q_stricmp( argv[i], "-textureshadows" ) )
 		{
 			g_bTextureShadows = true;
+		}
+		else if ( !Q_stricmp( argv[i], "-sunshadowmask" ) )
+		{
+			g_bBuildSunShadowMask = true;
+		}
+		else if ( !Q_stricmp( argv[i], "-sunshadowmaskres" ) )
+		{
+			if ( ++i < argc )
+			{
+				g_nSunShadowMaskRes = atoi( argv[i] );
+			}
 		}
 		else if ( !strcmp(argv[i], "-dump") )
 		{

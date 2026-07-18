@@ -346,6 +346,11 @@ extern float	g_SunAngularExtent;
 
 extern char		source[MAX_PATH];
 
+// Sun shadowmask baking (sunshadowmask.cpp)
+extern bool		g_bBuildSunShadowMask;
+extern int		g_nSunShadowMaskRes;
+void BuildSunShadowMask();
+
 // Used by incremental lighting to trivial-reject faces.
 // There is a bit in here for each face telling whether or not any of the
 // active lights can see the face.
