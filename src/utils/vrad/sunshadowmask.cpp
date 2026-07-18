@@ -23,7 +23,36 @@
 
 // Options set from the command line (vrad.cpp).
 bool g_bBuildSunShadowMask = false;
+bool g_bDumpSunShadowMask = false;
 int  g_nSunShadowMaskRes = 1024;
+
+//-----------------------------------------------------------------------------
+// Minimal uncompressed 24-bit BGR TGA writer (top-left origin) for eyeballing
+// the baked mask. No dependencies so it can't drift from the bake output.
+//-----------------------------------------------------------------------------
+static void WriteDebugTGA( const char *pszPath, const unsigned char *pBGR, int nWidth, int nHeight )
+{
+	FILE *fp = fopen( pszPath, "wb" );
+	if ( !fp )
+	{
+		Msg( "-sunshadowmask: could not open %s for the debug image.\n", pszPath );
+		return;
+	}
+
+	unsigned char hdr[18];
+	memset( hdr, 0, sizeof( hdr ) );
+	hdr[2]  = 2;								// uncompressed true-color
+	hdr[12] = (unsigned char)( nWidth  & 0xFF );
+	hdr[13] = (unsigned char)( ( nWidth  >> 8 ) & 0xFF );
+	hdr[14] = (unsigned char)( nHeight & 0xFF );
+	hdr[15] = (unsigned char)( ( nHeight >> 8 ) & 0xFF );
+	hdr[16] = 24;								// bits per pixel
+	hdr[17] = 0x20;								// top-left origin
+
+	fwrite( hdr, 1, sizeof( hdr ), fp );
+	fwrite( pBGR, 1, (size_t)nWidth * nHeight * 3, fp );
+	fclose( fp );
+}
 
 // From lightmap.cpp / vrad
 extern void TestLine_DoesHitSky( FourVectors const& start, FourVectors const& stop,
@@ -185,6 +214,14 @@ void BuildSunShadowMask()
 
 	const float flInvDepthRange = ( flDepthRange > 0.0f ) ? 1.0f / flDepthRange : 0.0f;
 
+	// Optional debug image (BGR). Visibility as grayscale; columns that hit no
+	// surface (open sky) are tinted blue so coverage/gaps are obvious.
+	unsigned char *pDebugBGR = NULL;
+	if ( g_bDumpSunShadowMask )
+	{
+		pDebugBGR = (unsigned char *)malloc( (size_t)nRes * nRes * 3 );
+	}
+
 	for ( int y = 0; y < nRes; ++y )
 	{
 		for ( int x = 0; x < nRes; ++x )
@@ -196,10 +233,12 @@ void BuildSunShadowMask()
 			Vector vColStart = vOrigin + vAxisU * u + vAxisV * v + vSunDir * ( flMinD - flMargin );
 
 			unsigned char rgba[4] = { 0, 0xFF, 0xFF, 0xFF };	// vis 0, depth = no-hit
+			bool bHit = false;
 
 			float flHitDist = TraceColumnFirstHit( vColStart, vSunDir, flColumnLen );
 			if ( flHitDist >= 0.0f )
 			{
+				bHit = true;
 				Vector vHit = vColStart + vSunDir * flHitDist;
 				float d = DotProduct( vHit - vOrigin, vSunDir );
 				float flDepthNorm = clamp( ( d - flMinD ) * flInvDepthRange, 0.0f, 1.0f );
@@ -215,6 +254,19 @@ void BuildSunShadowMask()
 			}
 
 			buf.Put( rgba, 4 );
+
+			if ( pDebugBGR )
+			{
+				unsigned char *pPixel = pDebugBGR + ( (size_t)y * nRes + x ) * 3;
+				if ( bHit )
+				{
+					pPixel[0] = pPixel[1] = pPixel[2] = rgba[0];	// grayscale visibility
+				}
+				else
+				{
+					pPixel[0] = 0x80; pPixel[1] = 0x00; pPixel[2] = 0x00;	// blue: no surface
+				}
+			}
 		}
 
 		if ( ( y & 63 ) == 0 )
@@ -242,4 +294,14 @@ void BuildSunShadowMask()
 
 	Msg( "\r-sunshadowmask: wrote %s (%d KB) in %.1fs\n",
 		szName, buf.TellPut() / 1024, Plat_FloatTime() - flStart );
+
+	if ( pDebugBGR )
+	{
+		char szTGA[1024];
+		Q_StripExtension( source, szTGA, sizeof( szTGA ) );
+		Q_strncat( szTGA, "_sunshadow.tga", sizeof( szTGA ), COPY_ALL_CHARACTERS );
+		WriteDebugTGA( szTGA, pDebugBGR, nRes, nRes );
+		Msg( "-sunshadowmask: wrote debug image %s\n", szTGA );
+		free( pDebugBGR );
+	}
 }

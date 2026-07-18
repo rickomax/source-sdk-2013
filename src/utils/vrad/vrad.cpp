@@ -2391,6 +2391,11 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 		{
 			g_bBuildSunShadowMask = true;
 		}
+		else if ( !Q_stricmp( argv[i], "-sunshadowmask_dump" ) )
+		{
+			g_bBuildSunShadowMask = true;
+			g_bDumpSunShadowMask = true;
+		}
 		else if ( !Q_stricmp( argv[i], "-sunshadowmaskres" ) )
 		{
 			if ( ++i < argc )

@@ -348,6 +348,7 @@ extern char		source[MAX_PATH];
 
 // Sun shadowmask baking (sunshadowmask.cpp)
 extern bool		g_bBuildSunShadowMask;
+extern bool		g_bDumpSunShadowMask;
 extern int		g_nSunShadowMaskRes;
 void BuildSunShadowMask();
 
