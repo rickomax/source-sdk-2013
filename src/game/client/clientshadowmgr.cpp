@@ -734,8 +734,8 @@ public:
 	virtual void SetFlashlightOrtho( ClientShadowHandle_t shadowHandle, bool bOrtho,
 		float flLeft, float flTop, float flRight, float flBottom );
 
-	virtual void PushSunlightForViewModels();
-	virtual void PopSunlightForViewModels();
+	virtual bool SetupSunlightViewModelPass();
+	virtual void FinishSunlightViewModelPass();
 
 	// Reallocates the depth textures (e.g. after r_sunshadow_depthres changes).
 	// Safe no-op if depth texturing hasn't been initialized yet.
@@ -1005,10 +1005,6 @@ private:
 	// These members maintain current state of depth texturing (size and global active state)
 	// If either changes in a frame, PreRender() will catch it and do the appropriate allocation, deallocation or reallocation
 	bool m_bDepthTextureActive;
-
-	// Engine handle of the sun flashlight bound around the view model draw
-	// (see PushSunlightForViewModels); SHADOW_HANDLE_INVALID when not bracketing.
-	ShadowHandle_t m_hViewModelSunFlashlight;
 	int m_nDepthTextureResolution; // Assume square (height == width)
 
 	CUtlVector< CTextureReference > m_DepthTextureCache;
@@ -1227,7 +1223,6 @@ CClientShadowMgr::CClientShadowMgr() :
 {
 	m_nDepthTextureResolution = r_flashlightdepthres.GetInt();
 	m_bThreaded = false;
-	m_hViewModelSunFlashlight = SHADOW_HANDLE_INVALID;
 }
 
 
@@ -2836,17 +2831,17 @@ void CClientShadowMgr::BuildFlashlight( ClientShadowHandle_t handle )
 
 
 //-----------------------------------------------------------------------------
-// Brackets the view model render pass so the orthographic sun shadow lights the
-// player's weapon. On PC the flashlight is applied by a deferred additive pass
-// over the main-view render list (see SetViewFlashlightState, which no-ops on
-// PC) -- view models are collated and drawn separately, so they're never in
-// that list. Setting the flashlight render state around their draw renders them
-// inline with the flashlight combo instead, exactly as the deferred pass does
-// per world model. Scoped to the sun so the player flashlight is unaffected.
+// Sunlight pass for view models. On PC a flashlight lights a model by
+// RE-DRAWING it with the render context in flashlight mode: materials then
+// render their additive flashlight variant, sampling the state/matrix/depth
+// texture set via SetFlashlightStateEx. The engine's deferred pass does this
+// for world geometry and world models; view models are drawn in their own
+// pass, so viewrender re-draws them between Setup/Finish below.
 //-----------------------------------------------------------------------------
-void CClientShadowMgr::PushSunlightForViewModels()
+bool CClientShadowMgr::SetupSunlightViewModelPass()
 {
-	m_hViewModelSunFlashlight = SHADOW_HANDLE_INVALID;
+	if ( !m_SunShadowDepthTexture.IsValid() )
+		return false;
 
 	for ( ClientShadowHandle_t i = m_Shadows.Head(); i != m_Shadows.InvalidIndex(); i = m_Shadows.Next(i) )
 	{
@@ -2858,23 +2853,22 @@ void CClientShadowMgr::PushSunlightForViewModels()
 		if ( !state.m_bEnableShadows )
 			continue;
 
-		m_hViewModelSunFlashlight = shadow.m_ShadowHandle;
-		break;
+		// The sun's depth texture was rendered earlier this view in
+		// ComputeShadowDepthTextures; bind everything the flashlight
+		// material variant needs and flip the context into flashlight mode.
+		CMatRenderContextPtr pRenderContext( materials );
+		pRenderContext->SetFlashlightMode( true );
+		pRenderContext->SetFlashlightStateEx( state, shadow.m_WorldToShadow, m_SunShadowDepthTexture );
+		return true;
 	}
 
-	if ( m_hViewModelSunFlashlight != SHADOW_HANDLE_INVALID )
-	{
-		shadowmgr->SetFlashlightRenderState( m_hViewModelSunFlashlight );
-	}
+	return false;
 }
 
-void CClientShadowMgr::PopSunlightForViewModels()
+void CClientShadowMgr::FinishSunlightViewModelPass()
 {
-	if ( m_hViewModelSunFlashlight != SHADOW_HANDLE_INVALID )
-	{
-		shadowmgr->SetFlashlightRenderState( SHADOW_HANDLE_INVALID );
-		m_hViewModelSunFlashlight = SHADOW_HANDLE_INVALID;
-	}
+	CMatRenderContextPtr pRenderContext( materials );
+	pRenderContext->SetFlashlightMode( false );
 }
 
 //-----------------------------------------------------------------------------

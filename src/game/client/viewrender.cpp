@@ -1122,15 +1122,18 @@ void CViewRender::DrawViewModels( const CViewSetup &view, bool drawViewmodel )
 			UpdateRefractIfNeededByList( translucentViewModelList );
 		}
 
-		// Bind the sun shadow flashlight (if any) so the view models pick up the
-		// sun shadowmap; on PC the flashlight's normal deferred pass never
-		// touches view models because they're drawn in this separate pass.
-		g_pClientShadowMgr->PushSunlightForViewModels();
-
 		DrawRenderablesInList( opaqueViewModelList );
 		DrawRenderablesInList( translucentViewModelList, STUDIO_TRANSPARENCY );
 
-		g_pClientShadowMgr->PopSunlightForViewModels();
+		// Additive sunlight pass: flashlights light a model by re-drawing it
+		// with the render context in flashlight mode. View models are outside
+		// the deferred flashlight pass that covers the world, so re-draw them
+		// here with the sun's flashlight state bound.
+		if ( g_pClientShadowMgr->SetupSunlightViewModelPass() )
+		{
+			DrawRenderablesInList( opaqueViewModelList );
+			g_pClientShadowMgr->FinishSunlightViewModelPass();
+		}
 	}
 
 	// Reset the depth range to the original values
