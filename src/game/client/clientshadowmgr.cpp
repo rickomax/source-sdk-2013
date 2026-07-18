@@ -69,8 +69,6 @@
 #include "collisionutils.h"
 #include "iviewrender.h"
 #include "ivrenderview.h"
-#include "c_baseplayer.h"
-#include "c_baseviewmodel.h"
 #include "tier0/vprof.h"
 #include "engine/ivmodelinfo.h"
 #include "view_shared.h"
@@ -736,6 +734,9 @@ public:
 	virtual void SetFlashlightOrtho( ClientShadowHandle_t shadowHandle, bool bOrtho,
 		float flLeft, float flTop, float flRight, float flBottom );
 
+	virtual void PushSunlightForViewModels();
+	virtual void PopSunlightForViewModels();
+
 	// Reallocates the depth textures (e.g. after r_sunshadow_depthres changes).
 	// Safe no-op if depth texturing hasn't been initialized yet.
 	void ReallocateDepthTextures()
@@ -974,10 +975,6 @@ private:
 	// Sets the view's active flashlight render state
 	void	SetViewFlashlightState( int nActiveFlashlightCount, ClientShadowHandle_t* pActiveFlashlights );
 
-	// Explicitly attach the sun shadow flashlight to the local player's view
-	// models (they are outside the world-leaf marking).
-	void	AddSunShadowToViewModels( ClientShadowHandle_t handle );
-
 private:
 	Vector	m_SimpleShadowDir;
 	color32	m_AmbientLightColor;
@@ -1008,6 +1005,10 @@ private:
 	// These members maintain current state of depth texturing (size and global active state)
 	// If either changes in a frame, PreRender() will catch it and do the appropriate allocation, deallocation or reallocation
 	bool m_bDepthTextureActive;
+
+	// Engine handle of the sun flashlight bound around the view model draw
+	// (see PushSunlightForViewModels); SHADOW_HANDLE_INVALID when not bracketing.
+	ShadowHandle_t m_hViewModelSunFlashlight;
 	int m_nDepthTextureResolution; // Assume square (height == width)
 
 	CUtlVector< CTextureReference > m_DepthTextureCache;
@@ -1226,6 +1227,7 @@ CClientShadowMgr::CClientShadowMgr() :
 {
 	m_nDepthTextureResolution = r_flashlightdepthres.GetInt();
 	m_bThreaded = false;
+	m_hViewModelSunFlashlight = SHADOW_HANDLE_INVALID;
 }
 
 
@@ -2799,16 +2801,6 @@ void CClientShadowMgr::BuildFlashlight( ClientShadowHandle_t handle )
 		// Add the shadow to the client leaf system so it correctly marks
 		// leafs as being affected by a particular shadow
 		ClientLeafSystem()->ProjectFlashlight( shadow.m_ClientLeafShadowHandle, nCount, pLeafList );
-
-		// View models are collated and drawn in their own pass, outside the
-		// world-leaf renderable enumeration the leaf system walks above, so the
-		// sun shadow never reaches the player's weapon. Mark them explicitly
-		// here -- this runs during PreRender, before the view model draw pass,
-		// and the flashlight depth textures stay bound until end of the view.
-		if ( shadow.m_bOrtho )
-		{
-			AddSunShadowToViewModels( handle );
-		}
 		return;
 	}
 
@@ -2844,38 +2836,44 @@ void CClientShadowMgr::BuildFlashlight( ClientShadowHandle_t handle )
 
 
 //-----------------------------------------------------------------------------
-// Explicitly attaches a flashlight (the sun shadow) to the local player's view
-// models. They aren't part of the world-leaf renderable set, so the normal
-// ProjectFlashlight marking misses them.
+// Brackets the view model render pass so the orthographic sun shadow lights the
+// player's weapon. On PC the flashlight is applied by a deferred additive pass
+// over the main-view render list (see SetViewFlashlightState, which no-ops on
+// PC) -- view models are collated and drawn separately, so they're never in
+// that list. Setting the flashlight render state around their draw renders them
+// inline with the flashlight combo instead, exactly as the deferred pass does
+// per world model. Scoped to the sun so the player flashlight is unaffected.
 //-----------------------------------------------------------------------------
-void CClientShadowMgr::AddSunShadowToViewModels( ClientShadowHandle_t handle )
+void CClientShadowMgr::PushSunlightForViewModels()
 {
-	C_BasePlayer *pPlayer = C_BasePlayer::GetLocalPlayer();
-	if ( !pPlayer )
-		return;
+	m_hViewModelSunFlashlight = SHADOW_HANDLE_INVALID;
 
-	for ( int i = 0; i < MAX_VIEWMODELS; ++i )
+	for ( ClientShadowHandle_t i = m_Shadows.Head(); i != m_Shadows.InvalidIndex(); i = m_Shadows.Next(i) )
 	{
-		C_BaseViewModel *pViewModel = pPlayer->GetViewModel( i );
-		if ( !pViewModel )
+		ClientShadow_t &shadow = m_Shadows[i];
+		if ( !shadow.m_bOrtho || ( shadow.m_Flags & SHADOW_FLAGS_FLASHLIGHT ) == 0 )
 			continue;
 
-		if ( modelinfo->GetModelType( pViewModel->GetModel() ) != mod_studio )
+		const FlashlightState_t &state = shadowmgr->GetFlashlightState( shadow.m_ShadowHandle );
+		if ( !state.m_bEnableShadows )
 			continue;
 
-		// The view model isn't tracked by the leaf shadow system, so the normal
-		// per-frame RemoveShadowFromRenderables (which clears last frame's shadow
-		// off a model instance) never runs for it. Clear it ourselves before
-		// re-adding, otherwise the sun shadow accumulates on the instance every
-		// frame.
-		pViewModel->CreateModelInstance();
-		ModelInstanceHandle_t instance = pViewModel->GetModelInstance();
-		if ( instance != MODEL_INSTANCE_INVALID )
-		{
-			shadowmgr->RemoveAllShadowsFromModel( instance );
-		}
+		m_hViewModelSunFlashlight = shadow.m_ShadowHandle;
+		break;
+	}
 
-		AddShadowToReceiver( handle, pViewModel, SHADOW_RECEIVER_STUDIO_MODEL );
+	if ( m_hViewModelSunFlashlight != SHADOW_HANDLE_INVALID )
+	{
+		shadowmgr->SetFlashlightRenderState( m_hViewModelSunFlashlight );
+	}
+}
+
+void CClientShadowMgr::PopSunlightForViewModels()
+{
+	if ( m_hViewModelSunFlashlight != SHADOW_HANDLE_INVALID )
+	{
+		shadowmgr->SetFlashlightRenderState( SHADOW_HANDLE_INVALID );
+		m_hViewModelSunFlashlight = SHADOW_HANDLE_INVALID;
 	}
 }
 

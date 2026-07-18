@@ -61,6 +61,12 @@ public:
 	// bottom, matching MatrixBuildOrtho and CViewSetup ortho semantics).
 	virtual void SetFlashlightOrtho( ClientShadowHandle_t shadowHandle, bool bOrtho,
 		float flLeft, float flTop, float flRight, float flBottom ) = 0;
+
+	// Bracket the view model render pass so the orthographic sun shadow lights
+	// the player's weapon (view models are drawn outside the flashlight's
+	// deferred additive pass on PC). Push before drawing view models, Pop after.
+	virtual void PushSunlightForViewModels() = 0;
+	virtual void PopSunlightForViewModels() = 0;
 	
 	// Indicate that the shadow should be recomputed due to a change in
 	// the client entity
