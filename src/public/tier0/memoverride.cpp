@@ -644,10 +644,13 @@ size_t __cdecl _msize_dbg( void *pMem, int nBlockUse )
 
 #ifdef _WIN32
 
-// On the Universal CRT this is enabled in release too: CUtlMemoryAligned and
-// friends mix _aligned_malloc with MemAlloc_ReallocAligned/MemAlloc_FreeAligned,
-// so all of them must ride the same allocator.
-#if ( defined(_DEBUG) || _MSC_VER >= 1900 ) && _MSC_VER >= 1300
+// On the Universal CRT this is enabled in RELEASE instead of debug:
+// CUtlMemoryAligned and friends mix _aligned_malloc with
+// MemAlloc_ReallocAligned/MemAlloc_FreeAligned, so all of them must ride the
+// same allocator. In UCRT DEBUG builds the _aligned_* names are real exported
+// symbols of the debug CRT (and calls are remapped to _aligned_*_dbg anyway),
+// so overriding them there multiply-defines the symbols at link time.
+#if ( ( defined(_DEBUG) && _MSC_VER < 1900 ) || ( !defined(_DEBUG) && _MSC_VER >= 1900 ) ) && _MSC_VER >= 1300
 // X360TBD: aligned and offset allocations may be important on the 360
 
 // aligned base
@@ -1014,7 +1017,10 @@ void __cdecl _invalid_parameter_noinfo(void)
 
 #endif /* defined( _DEBUG ) */
 
-#if defined( _DEBUG ) || defined( USE_MEM_DEBUG )
+// Debug CRT report entry points: on the Universal CRT these are real symbols
+// the debug CRT defines and exports (_CrtDbgReportW, _CrtSetReportHook2, ...),
+// so overriding them multiply-defines the symbol -- pre-2015 CRTs only.
+#if ( defined( _DEBUG ) || defined( USE_MEM_DEBUG ) ) && defined( OVERRIDE_CRT_DEBUG_API )
 
 int __cdecl __crtMessageWindowW( int nRptType, const wchar_t * szFile, const wchar_t * szLine,
 								 const wchar_t * szModule, const wchar_t * szUserMessage )
