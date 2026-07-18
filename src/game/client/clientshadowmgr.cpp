@@ -3431,11 +3431,23 @@ bool CClientShadowMgr::CullReceiver( ClientShadowHandle_t handle, IClientRendera
 	{
 		VPROF_BUDGET( "CClientShadowMgr::CullReceiver", VPROF_BUDGETGROUP_SHADOW_DEPTH_TEXTURING );
 
-		Assert( !pSourceRenderable );	
-		const Frustum_t &frustum = shadowmgr->GetFlashlightFrustum( m_Shadows[handle].m_ShadowHandle );
+		Assert( !pSourceRenderable );
 
 		Vector mins, maxs;
 		pRenderable->GetRenderBoundsWorldspace( mins, maxs );
+
+		// Orthographic sun shadow: the engine's stored flashlight frustum is
+		// derived from the perspective parameters in FlashlightState_t (which
+		// are placeholders for the sun), not from our ortho matrix -- so cull
+		// against the real ortho volume instead.
+		if ( m_Shadows[handle].m_bOrtho )
+		{
+			Vector vecVolumeMins, vecVolumeMaxs;
+			CalculateAABBFromProjectionMatrix( m_Shadows[handle].m_WorldToShadow, &vecVolumeMins, &vecVolumeMaxs );
+			return !IsBoxIntersectingBox( mins, maxs, vecVolumeMins, vecVolumeMaxs );
+		}
+
+		const Frustum_t &frustum = shadowmgr->GetFlashlightFrustum( m_Shadows[handle].m_ShadowHandle );
 
 		return R_CullBox( mins, maxs, frustum );
 	}
@@ -3565,10 +3577,36 @@ bool CClientShadowMgr::CullReceiver( ClientShadowHandle_t handle, IClientRendera
 //-----------------------------------------------------------------------------
 // deals with shadows being added to shadow receivers
 //-----------------------------------------------------------------------------
+// Diagnostics for the sun shadow's model-receiver path: counts how many
+// renderables were offered/rejected/added each second so failures in the
+// marking chain are visible in the console.
+static ConVar r_sunshadow_debugreceivers( "r_sunshadow_debugreceivers", "0", FCVAR_CHEAT,
+	"Print per-second stats about renderables receiving the sun shadow flashlight pass." );
+static int s_nSunReceiversOffered, s_nSunReceiversNoReceive, s_nSunReceiversCulled, s_nSunReceiversAdded;
+static float s_flSunReceiverLastPrint;
+
+static void SunReceiverStatsTick()
+{
+	if ( gpGlobals->curtime - s_flSunReceiverLastPrint >= 1.0f )
+	{
+		Msg( "Sun receivers: offered %d, no-receive %d, culled %d, added %d\n",
+			s_nSunReceiversOffered, s_nSunReceiversNoReceive, s_nSunReceiversCulled, s_nSunReceiversAdded );
+		s_nSunReceiversOffered = s_nSunReceiversNoReceive = s_nSunReceiversCulled = s_nSunReceiversAdded = 0;
+		s_flSunReceiverLastPrint = gpGlobals->curtime;
+	}
+}
+
 void CClientShadowMgr::AddShadowToReceiver( ClientShadowHandle_t handle,
 	IClientRenderable* pRenderable, ShadowReceiver_t type )
 {
 	ClientShadow_t &shadow = m_Shadows[handle];
+
+	bool bDebugSun = shadow.m_bOrtho && r_sunshadow_debugreceivers.GetBool();
+	if ( bDebugSun )
+	{
+		++s_nSunReceiversOffered;
+		SunReceiverStatsTick();
+	}
 
 	// Don't add a shadow cast by an object to itself...
 	IClientRenderable* pSourceRenderable = ClientEntityList().GetClientRenderableFromHandle( shadow.m_Entity );
@@ -3579,11 +3617,22 @@ void CClientShadowMgr::AddShadowToReceiver( ClientShadowHandle_t handle,
 
 	// Don't bother if this renderable doesn't receive shadows or light from flashlights
 	if( !pRenderable->ShouldReceiveProjectedTextures( SHADOW_FLAGS_PROJECTED_TEXTURE_TYPE_MASK ) )
+	{
+		if ( bDebugSun )
+			++s_nSunReceiversNoReceive;
 		return;
+	}
 
 	// Cull if the origin is on the wrong side of a shadow clip plane....
 	if ( CullReceiver( handle, pRenderable, pSourceRenderable ) )
+	{
+		if ( bDebugSun )
+			++s_nSunReceiversCulled;
 		return;
+	}
+
+	if ( bDebugSun )
+		++s_nSunReceiversAdded;
 
 	// Do different things depending on the receiver type
 	switch( type )
