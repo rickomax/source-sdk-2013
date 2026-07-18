@@ -69,6 +69,8 @@
 #include "collisionutils.h"
 #include "iviewrender.h"
 #include "ivrenderview.h"
+#include "c_baseplayer.h"
+#include "c_baseviewmodel.h"
 #include "tier0/vprof.h"
 #include "engine/ivmodelinfo.h"
 #include "view_shared.h"
@@ -971,6 +973,10 @@ private:
 
 	// Sets the view's active flashlight render state
 	void	SetViewFlashlightState( int nActiveFlashlightCount, ClientShadowHandle_t* pActiveFlashlights );
+
+	// Explicitly attach the sun shadow flashlight to the local player's view
+	// models (they are outside the world-leaf marking).
+	void	AddSunShadowToViewModels( ClientShadowHandle_t handle );
 
 private:
 	Vector	m_SimpleShadowDir;
@@ -2790,9 +2796,19 @@ void CClientShadowMgr::BuildFlashlight( ClientShadowHandle_t handle )
 
 	if ( !bLightSpecificEntity )
 	{
-		// Add the shadow to the client leaf system so it correctly marks 
+		// Add the shadow to the client leaf system so it correctly marks
 		// leafs as being affected by a particular shadow
 		ClientLeafSystem()->ProjectFlashlight( shadow.m_ClientLeafShadowHandle, nCount, pLeafList );
+
+		// View models are collated and drawn in their own pass, outside the
+		// world-leaf renderable enumeration the leaf system walks above, so the
+		// sun shadow never reaches the player's weapon. Mark them explicitly
+		// here -- this runs during PreRender, before the view model draw pass,
+		// and the flashlight depth textures stay bound until end of the view.
+		if ( shadow.m_bOrtho )
+		{
+			AddSunShadowToViewModels( handle );
+		}
 		return;
 	}
 
@@ -2826,6 +2842,42 @@ void CClientShadowMgr::BuildFlashlight( ClientShadowHandle_t handle )
 	}
 }
 
+
+//-----------------------------------------------------------------------------
+// Explicitly attaches a flashlight (the sun shadow) to the local player's view
+// models. They aren't part of the world-leaf renderable set, so the normal
+// ProjectFlashlight marking misses them.
+//-----------------------------------------------------------------------------
+void CClientShadowMgr::AddSunShadowToViewModels( ClientShadowHandle_t handle )
+{
+	C_BasePlayer *pPlayer = C_BasePlayer::GetLocalPlayer();
+	if ( !pPlayer )
+		return;
+
+	for ( int i = 0; i < MAX_VIEWMODELS; ++i )
+	{
+		C_BaseViewModel *pViewModel = pPlayer->GetViewModel( i );
+		if ( !pViewModel )
+			continue;
+
+		if ( modelinfo->GetModelType( pViewModel->GetModel() ) != mod_studio )
+			continue;
+
+		// The view model isn't tracked by the leaf shadow system, so the normal
+		// per-frame RemoveShadowFromRenderables (which clears last frame's shadow
+		// off a model instance) never runs for it. Clear it ourselves before
+		// re-adding, otherwise the sun shadow accumulates on the instance every
+		// frame.
+		pViewModel->CreateModelInstance();
+		ModelInstanceHandle_t instance = pViewModel->GetModelInstance();
+		if ( instance != MODEL_INSTANCE_INVALID )
+		{
+			shadowmgr->RemoveAllShadowsFromModel( instance );
+		}
+
+		AddShadowToReceiver( handle, pViewModel, SHADOW_RECEIVER_STUDIO_MODEL );
+	}
+}
 
 //-----------------------------------------------------------------------------
 // Adds the child bounds to the bounding box
