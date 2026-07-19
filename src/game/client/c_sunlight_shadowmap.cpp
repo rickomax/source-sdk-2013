@@ -66,6 +66,8 @@ static ConVar r_sunshadow_cascade_blend( "r_sunshadow_cascade_blend", "0.15", FC
 	"Fraction of each cascade over which it crossfades into the next, hiding the seam between cascades (0..0.5)." );
 static ConVar r_sunshadow_cascade_debug( "r_sunshadow_cascade_debug", "0", FCVAR_CHEAT,
 	"Tint each sun cascade a distinct colour (red/green/blue = near/mid/far) to see coverage and the crossfade overlaps." );
+static ConVar r_sunshadow_suppress_entityshadows( "r_sunshadow_suppress_entityshadows", "1", FCVAR_ARCHIVE,
+	"While the sun shadowmap cascades are active, disable the legacy projected/blob entity shadows (which use a single fixed angle and double up with the cascade). Entities still cast into the cascades." );
 
 //-----------------------------------------------------------------------------
 // Per-cascade overrides. Each defaults to a sentinel meaning "use the shared/
@@ -191,6 +193,7 @@ public:
 			m_flLastRadius[c] = -1.0f;	// force cookie generation on the first update
 		}
 		m_flLastBlend = -1.0f;
+		m_bSuppressedEntityShadows = false;
 		m_bHasSun = false;
 		m_nSunStyle = 0;
 		m_vecSunDirection.Init( 0, 0, -1 );
@@ -217,6 +220,7 @@ public:
 	{
 		DestroySunShadow();
 		FreeSunShadowMask();
+		SuppressEntityShadows( false );		// restore the legacy shadows we turned off
 		m_bHasSun = false;
 		m_nSunStyle = 0;
 	}
@@ -315,6 +319,7 @@ public:
 		{
 			DestroySunShadow();
 			PublishShaderParams( false );
+			SuppressEntityShadows( false );
 			return;
 		}
 
@@ -323,11 +328,25 @@ public:
 		{
 			DestroySunShadow();
 			PublishShaderParams( false );
+			SuppressEntityShadows( false );
 			return;
 		}
 
 		UpdateSunShadow( pPlayer->EyePosition() );
 		PublishShaderParams( true );
+		SuppressEntityShadows( true );
+	}
+
+	// While the cascades are active, turn off the legacy render-to-texture entity
+	// shadows (blobs / fixed-angle projected shadows) so they don't double up with
+	// the cascade shadows entities now cast. We only ever undo our own change.
+	void SuppressEntityShadows( bool bWantSuppressed )
+	{
+		bWantSuppressed = bWantSuppressed && r_sunshadow_suppress_entityshadows.GetBool();
+		if ( bWantSuppressed == m_bSuppressedEntityShadows )
+			return;
+		m_bSuppressedEntityShadows = bWantSuppressed;
+		g_pClientShadowMgr->SetShadowsDisabled( bWantSuppressed );
 	}
 
 	bool HasSun() const { return m_bHasSun; }
@@ -709,6 +728,7 @@ private:
 	CSunShadowCookieRegenerator m_CookieRegen[MAX_SUN_SHADOW_CASCADES];
 	float					m_flLastRadius[MAX_SUN_SHADOW_CASCADES];	// cascade shape the cookies were built for
 	float					m_flLastBlend;
+	bool					m_bSuppressedEntityShadows;	// we turned off the legacy RTT entity shadows
 	Vector					m_vecSunDirection;	// direction the sunlight travels (points down)
 	Vector					m_vecSunColor;		// normalized hue from the BSP skylight
 	int						m_nSunStyle;		// lightstyle VRAD baked the skylight with
