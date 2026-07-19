@@ -108,7 +108,7 @@ private:
 
 	// Methods associated with unserializing static props
 	void UnserializeModelDict( CUtlBuffer& buf );
-	void UnserializeModels( CUtlBuffer& buf );
+	void UnserializeModels( CUtlBuffer& buf, int nLumpVersion );
 	void UnserializeStaticProps();
 
 	// Creates a collision model
@@ -850,16 +850,53 @@ void CVradStaticPropMgr::UnserializeModelDict( CUtlBuffer& buf )
 	}
 }
 
-void CVradStaticPropMgr::UnserializeModels( CUtlBuffer& buf )
+void CVradStaticPropMgr::UnserializeModels( CUtlBuffer& buf, int nLumpVersion )
 {
 	int count = buf.GetInt();
 
 	m_StaticProps.AddMultipleToTail(count);
-	for ( int i = 0; i < count; ++i )				  
+	for ( int i = 0; i < count; ++i )
 	{
+		// The static prop lump record grew across versions (v4 -> v5 added
+		// m_flForcedFadeScale; v5 -> v6 added m_nMinDXLevel/m_nMaxDXLevel), so
+		// each record is a different size on disk. Read the layout that matches
+		// this map's lump version, otherwise the buffer desyncs after the first
+		// prop and every subsequent prop is garbage. VRAD only needs the common
+		// prefix (origin/angles/lighting origin/flags/prop type), which is
+		// identical in all three layouts.
 		StaticPropLump_t lump;
-		buf.Get( &lump, sizeof(StaticPropLump_t) );
-		
+		memset( &lump, 0, sizeof( lump ) );
+		switch ( nLumpVersion )
+		{
+		case 4:
+			{
+				StaticPropLumpV4_t lumpV4;
+				buf.Get( &lumpV4, sizeof( lumpV4 ) );
+				lump.m_Origin			= lumpV4.m_Origin;
+				lump.m_Angles			= lumpV4.m_Angles;
+				lump.m_PropType			= lumpV4.m_PropType;
+				lump.m_Flags			= lumpV4.m_Flags;
+				lump.m_LightingOrigin	= lumpV4.m_LightingOrigin;
+			}
+			break;
+
+		case 5:
+			{
+				StaticPropLumpV5_t lumpV5;
+				buf.Get( &lumpV5, sizeof( lumpV5 ) );
+				lump.m_Origin			= lumpV5.m_Origin;
+				lump.m_Angles			= lumpV5.m_Angles;
+				lump.m_PropType			= lumpV5.m_PropType;
+				lump.m_Flags			= lumpV5.m_Flags;
+				lump.m_LightingOrigin	= lumpV5.m_LightingOrigin;
+			}
+			break;
+
+		default:	// v6 (GAMELUMP_STATIC_PROPS_VERSION) -- current layout
+			buf.Get( &lump, sizeof(StaticPropLump_t) );
+			break;
+		}
+
 		VectorCopy( lump.m_Origin, m_StaticProps[i].m_Origin );
 		VectorCopy( lump.m_Angles, m_StaticProps[i].m_Angles );
 		VectorCopy( lump.m_LightingOrigin, m_StaticProps[i].m_LightingOrigin );
@@ -882,9 +919,14 @@ void CVradStaticPropMgr::UnserializeStaticProps()
 	if (!size)
 		return;
 
-	if ( g_GameLumps.GetGameLumpVersion( handle ) != GAMELUMP_STATIC_PROPS_VERSION )
+	// Accept the static prop lump versions whose layouts we know how to read
+	// (v4 and v5 from stock HL2/Ep maps, v6 from the SDK's own vbsp). Only a
+	// version newer than we understand is a hard error.
+	int nLumpVersion = g_GameLumps.GetGameLumpVersion( handle );
+	if ( nLumpVersion < 4 || nLumpVersion > GAMELUMP_STATIC_PROPS_VERSION )
 	{
-		Error( "Cannot load the static props... encountered a stale map version. Re-vbsp the map." );
+		Error( "Unknown static prop lump version %d (this VRAD understands 4-%d). Re-vbsp the map.\n",
+			nLumpVersion, GAMELUMP_STATIC_PROPS_VERSION );
 	}
 
 	if ( g_GameLumps.GetGameLump( handle ) )
@@ -896,7 +938,7 @@ void CVradStaticPropMgr::UnserializeStaticProps()
 		int count = buf.GetInt();
 		buf.SeekGet( CUtlBuffer::SEEK_CURRENT, count * sizeof(StaticPropLeafLump_t) );
 
-		UnserializeModels( buf );
+		UnserializeModels( buf, nLumpVersion );
 	}
 }
 
