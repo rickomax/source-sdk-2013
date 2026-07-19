@@ -56,6 +56,10 @@ static ConVar r_sunshadow_depthbias( "r_sunshadow_depthbias", "0.0005", 0 );
 static ConVar r_sunshadow_slopescale( "r_sunshadow_slopescale", "4", 0 );
 static ConVar r_sunshadow_maskbias( "r_sunshadow_maskbias", "6.0", 0,
 	"Baked shadowmask depth-compare bias, in world units. A point is treated as sun-shadowed when it sits this far behind the nearest baked sun-facing surface." );
+static ConVar r_sunshadow_darkness( "r_sunshadow_darkness", "0.35", FCVAR_ARCHIVE,
+	"How dark a fully dynamically-shadowed but baked-lit surface goes (0 = black, 1 = no darkening). Only affects surfaces the darkening world shader touches." );
+static ConVar r_sunshadow_worldshader( "r_sunshadow_worldshader", "1", FCVAR_ARCHIVE,
+	"Publish sun shadow parameters to the darkening world shader (requires the mod's game_shader_dx9 override of LightmappedGeneric)." );
 
 //-----------------------------------------------------------------------------
 // Procedural cookie: white core with a smooth falloff to black over the outer
@@ -126,6 +130,7 @@ public:
 		m_vecSunDirection.Init( 0, 0, -1 );
 		m_vecSunColor.Init( 1, 1, 1 );
 		m_bHasMask = false;
+		m_flLastPublishedParams0X = 0.0f;
 		memset( &m_MaskHeader, 0, sizeof( m_MaskHeader ) );
 	}
 
@@ -243,6 +248,7 @@ public:
 			 !materials->SupportsShadowDepthTextures() )
 		{
 			DestroySunShadow();
+			PublishShaderParams( false );
 			return;
 		}
 
@@ -250,10 +256,12 @@ public:
 		if ( !pPlayer )
 		{
 			DestroySunShadow();
+			PublishShaderParams( false );
 			return;
 		}
 
 		UpdateSunShadow( pPlayer->EyePosition() );
+		PublishShaderParams( true );
 	}
 
 	bool HasSun() const { return m_bHasSun; }
@@ -424,6 +432,73 @@ private:
 	}
 
 	//-----------------------------------------------------------------------------
+	// Publish the two affine world->space transforms (baked mask and runtime sun
+	// depth map) plus scalars to the material system's render parameters, where
+	// the overriding LightmappedGeneric shader reads them. Both projections are
+	// orthographic, so each is affine: result = Dot( worldPos, row ) + trans.
+	// When the feature is off we publish enabled=0 so the shader early-outs.
+	//-----------------------------------------------------------------------------
+	void PublishShaderParams( bool bActive )
+	{
+		CMatRenderContextPtr pRenderContext( materials );
+
+		VMatrix worldToSun;
+		bool bReady = bActive && m_bHasMask && r_sunshadow_worldshader.GetBool() &&
+			g_pClientShadowMgr->GetSunShadowToTextureMatrix( worldToSun );
+
+		if ( !bReady )
+		{
+			pRenderContext->SetVectorRenderingParameter( SUNSHADOW_RP_PARAMS0, Vector( 0, 0, 0 ) );
+			m_flLastPublishedParams0X = 0.0f;
+			return;
+		}
+
+		const SunShadowMaskHeader_t &h = m_MaskHeader;
+		Vector vSunDir( h.vecSunDir[0], h.vecSunDir[1], h.vecSunDir[2] );
+		Vector vOrigin( h.vecOrigin[0], h.vecOrigin[1], h.vecOrigin[2] );
+		Vector vU( h.vecAxisU[0], h.vecAxisU[1], h.vecAxisU[2] );
+		Vector vV( h.vecAxisV[0], h.vecAxisV[1], h.vecAxisV[2] );
+
+		float flRangeU = MAX( h.flMaxU - h.flMinU, 1e-4f );
+		float flRangeV = MAX( h.flMaxV - h.flMinV, 1e-4f );
+		float flRangeD = MAX( h.flMaxDepth - h.flMinDepth, 1e-4f );
+
+		// Baked-mask transform: world -> ( maskU[0,1], maskV[0,1], depthNorm[0,1] ).
+		Vector vMaskRowU = vU / flRangeU;
+		Vector vMaskRowV = vV / flRangeV;
+		Vector vMaskRowD = vSunDir / flRangeD;
+		Vector vMaskTrans(
+			-( DotProduct( vOrigin, vU ) + h.flMinU ) / flRangeU,
+			-( DotProduct( vOrigin, vV ) + h.flMinV ) / flRangeV,
+			-( DotProduct( vOrigin, vSunDir ) + h.flMinDepth ) / flRangeD );
+
+		pRenderContext->SetVectorRenderingParameter( SUNSHADOW_RP_MASK_ROW_U, vMaskRowU );
+		pRenderContext->SetVectorRenderingParameter( SUNSHADOW_RP_MASK_ROW_V, vMaskRowV );
+		pRenderContext->SetVectorRenderingParameter( SUNSHADOW_RP_MASK_ROW_D, vMaskRowD );
+		pRenderContext->SetVectorRenderingParameter( SUNSHADOW_RP_MASK_TRANS, vMaskTrans );
+
+		// Runtime sun depth transform: world -> ( shadowU[0,1], shadowV[0,1],
+		// depth[0,1] ). worldToSun is the ortho flashlight world->texture matrix,
+		// so rows 0..2 are the affine outputs (w is constant 1 for ortho).
+		pRenderContext->SetVectorRenderingParameter( SUNSHADOW_RP_SUN_ROW_U,
+			Vector( worldToSun[0][0], worldToSun[0][1], worldToSun[0][2] ) );
+		pRenderContext->SetVectorRenderingParameter( SUNSHADOW_RP_SUN_ROW_V,
+			Vector( worldToSun[1][0], worldToSun[1][1], worldToSun[1][2] ) );
+		pRenderContext->SetVectorRenderingParameter( SUNSHADOW_RP_SUN_ROW_D,
+			Vector( worldToSun[2][0], worldToSun[2][1], worldToSun[2][2] ) );
+		pRenderContext->SetVectorRenderingParameter( SUNSHADOW_RP_SUN_TRANS,
+			Vector( worldToSun[0][3], worldToSun[1][3], worldToSun[2][3] ) );
+
+		float flMaskBiasNorm = r_sunshadow_maskbias.GetFloat() / flRangeD;
+		pRenderContext->SetVectorRenderingParameter( SUNSHADOW_RP_PARAMS0,
+			Vector( 1.0f, flMaskBiasNorm, r_sunshadow_depthbias.GetFloat() ) );
+		pRenderContext->SetVectorRenderingParameter( SUNSHADOW_RP_PARAMS1,
+			Vector( clamp( r_sunshadow_darkness.GetFloat(), 0.0f, 1.0f ), 0.0f, 0.0f ) );
+
+		m_flLastPublishedParams0X = 1.0f;
+	}
+
+	//-----------------------------------------------------------------------------
 	// Load the VRAD-baked mask sidecar (maps/<name>.sunshadow) for this level.
 	//-----------------------------------------------------------------------------
 	void LoadSunShadowMask()
@@ -495,6 +570,11 @@ private:
 	SunShadowMaskHeader_t	m_MaskHeader;
 	CUtlMemory<unsigned char> m_MaskData;		// nRes*nRes*4, BGRA-order (R=vis, GB=depth)
 	CTextureReference		m_MaskTexture;		// GPU copy for the shader (Stage 3)
+
+public:
+	bool IsPublishingShaderParams() const { return m_flLastPublishedParams0X > 0.5f; }
+private:
+	float					m_flLastPublishedParams0X;	// last enabled flag pushed to the shader
 };
 
 static CSunlightShadowManager s_SunlightShadowManager;
@@ -589,6 +669,9 @@ CON_COMMAND( r_sunshadow_info, "Prints sun shadowmap status for the current map.
 
 	Msg( "  baked mask: %s\n", s_SunlightShadowManager.HasBakedMask()
 		? "loaded (maps/<name>.sunshadow)" : "none (bake with vrad -sunshadowmask)" );
+	Msg( "  world shader darkening: %s\n", s_SunlightShadowManager.IsPublishingShaderParams()
+		? "publishing params to LightmappedGeneric override"
+		: "inactive (needs baked mask + r_sunshadow_worldshader 1 + game_shader_dx9 override)" );
 
 	if ( !materials->SupportsShadowDepthTextures() )
 	{

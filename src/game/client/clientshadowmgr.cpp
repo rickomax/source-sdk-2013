@@ -736,6 +736,7 @@ public:
 
 	virtual bool SetupSunlightViewModelPass();
 	virtual void FinishSunlightViewModelPass();
+	virtual bool GetSunShadowToTextureMatrix( VMatrix &worldToShadowTexture );
 
 	// Reallocates the depth textures (e.g. after r_sunshadow_depthres changes).
 	// Safe no-op if depth texturing hasn't been initialized yet.
@@ -2869,6 +2870,32 @@ void CClientShadowMgr::FinishSunlightViewModelPass()
 {
 	CMatRenderContextPtr pRenderContext( materials );
 	pRenderContext->SetFlashlightMode( false );
+}
+
+//-----------------------------------------------------------------------------
+// Hands back the sun ortho shadow's world->shadow-texture matrix so a world
+// shader (via render parameters) can sample the runtime sun depth map itself.
+//-----------------------------------------------------------------------------
+bool CClientShadowMgr::GetSunShadowToTextureMatrix( VMatrix &worldToShadowTexture )
+{
+	if ( !m_SunShadowDepthTexture.IsValid() )
+		return false;
+
+	for ( ClientShadowHandle_t i = m_Shadows.Head(); i != m_Shadows.InvalidIndex(); i = m_Shadows.Next(i) )
+	{
+		ClientShadow_t &shadow = m_Shadows[i];
+		if ( !shadow.m_bOrtho || ( shadow.m_Flags & SHADOW_FLAGS_FLASHLIGHT ) == 0 )
+			continue;
+
+		const FlashlightState_t &state = shadowmgr->GetFlashlightState( shadow.m_ShadowHandle );
+		if ( !state.m_bEnableShadows )
+			continue;
+
+		worldToShadowTexture = shadow.m_WorldToShadow;
+		return true;
+	}
+
+	return false;
 }
 
 //-----------------------------------------------------------------------------

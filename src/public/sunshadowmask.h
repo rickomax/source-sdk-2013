@@ -55,4 +55,37 @@ struct SunShadowMaskHeader_t
 	float	flMinDepth, flMaxDepth;	// depth extents along the sun direction
 };
 
+//-----------------------------------------------------------------------------
+// Client->shader contract for the darkening world shader.
+//
+// The client sun system publishes two affine world->space transforms plus a
+// couple of scalars through the material system's VECTOR render parameters
+// (slots 10..19 are unused by the stock engine). The overriding LightmappedGeneric
+// shader reads them back, forwards them as pixel-shader constants, and:
+//   * projects the surface world position into the baked mask (rows M_*) to read
+//     the baked sun visibility, and
+//   * projects it into the runtime sun depth map (rows S_*, texture
+//     "_rt_SunShadowDepth") to read the dynamic sun shadow,
+// then multiplies the lightmap by lerp( 1, dynamicSunVis, bakedSunVis ) so baked
+// shadows are preserved and only baked-lit surfaces take the dynamic shadow.
+//
+// Each transform is affine (both projections are orthographic): a value is
+//   result = Dot( worldPos, row.xyz ) + translation
+// so a full 3-output transform needs 3 rows + 1 translation vector = 4 slots.
+enum SunShadowRenderParm_t
+{
+	SUNSHADOW_RP_MASK_ROW_U   = 10,	// world->baked mask U  (linear part)
+	SUNSHADOW_RP_MASK_ROW_V   = 11,	// world->baked mask V  (linear part)
+	SUNSHADOW_RP_MASK_ROW_D   = 12,	// world->baked mask depthNorm (linear part)
+	SUNSHADOW_RP_MASK_TRANS   = 13,	// (transU, transV, transDepth) for the mask
+
+	SUNSHADOW_RP_SUN_ROW_U    = 14,	// world->runtime depth map U (linear part)
+	SUNSHADOW_RP_SUN_ROW_V    = 15,	// world->runtime depth map V (linear part)
+	SUNSHADOW_RP_SUN_ROW_D    = 16,	// world->runtime depth map projected depth (linear part)
+	SUNSHADOW_RP_SUN_TRANS    = 17,	// (transU, transV, transDepth) for the depth map
+
+	SUNSHADOW_RP_PARAMS0      = 18,	// x = enabled(0/1), y = mask depth bias, z = sun depth bias
+	SUNSHADOW_RP_PARAMS1      = 19,	// x = min darkening (how dark a full dynamic shadow goes), yz reserved
+};
+
 #endif // SUNSHADOWMASK_H

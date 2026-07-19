@@ -69,6 +69,12 @@ public:
 	// drawn outside the flashlight's deferred world pass on PC, hence this.
 	virtual bool SetupSunlightViewModelPass() = 0;
 	virtual void FinishSunlightViewModelPass() = 0;
+
+	// Returns the sun ortho shadow's world->shadow-texture matrix (the same one
+	// the runtime sun depth map at "_rt_SunShadowDepth" was rendered with), so a
+	// world shader can project a surface into that depth map and read back the
+	// dynamic sun shadow. Returns false if there is no active sun ortho shadow.
+	virtual bool GetSunShadowToTextureMatrix( VMatrix &worldToShadowTexture ) = 0;
 	
 	// Indicate that the shadow should be recomputed due to a change in
 	// the client entity
