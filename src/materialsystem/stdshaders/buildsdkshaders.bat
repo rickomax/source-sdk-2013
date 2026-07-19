@@ -9,10 +9,28 @@ rem The legacy VSxxxCOMNTOOLS environment variables were removed after VS 2015,
 rem so locate the installation with vswhere and call VsDevCmd.bat instead.
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "%VSWHERE%" set "VSWHERE=%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" (
+	echo ERROR: vswhere.exe not found. Install Visual Studio ^(with the "Desktop
+	echo development with C++" workload^) or run this from a Developer Command Prompt.
+	exit /b 1
+)
+
+rem -prerelease is required for VS2026/preview channels; try the C++ toolset
+rem filter first, then fall back to any latest install if the component id
+rem differs on newer VS versions.
 set "VSINSTALLPATH="
-for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALLPATH=%%i"
+for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2^>nul`) do set "VSINSTALLPATH=%%i"
+if not defined VSINSTALLPATH for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -prerelease -products * -property installationPath 2^>nul`) do set "VSINSTALLPATH=%%i"
 if not defined VSINSTALLPATH (
 	echo ERROR: Could not locate a Visual Studio installation with the C++ toolset.
+	echo Checked with: "%VSWHERE%"
+	echo If VS is installed, open a "Developer Command Prompt for VS" and run
+	echo buildshaders.bat directly, or ensure the "Desktop development with C++"
+	echo workload is installed.
+	exit /b 1
+)
+if not exist "%VSINSTALLPATH%\Common7\Tools\VsDevCmd.bat" (
+	echo ERROR: Found VS at "%VSINSTALLPATH%" but VsDevCmd.bat is missing.
 	exit /b 1
 )
 call "%VSINSTALLPATH%\Common7\Tools\VsDevCmd.bat" -arch=x86 -no_logo
