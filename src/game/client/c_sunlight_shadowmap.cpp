@@ -34,6 +34,7 @@
 #include "c_baseplayer.h"
 #include "view_shared.h"
 #include "mathlib/vmatrix.h"
+#include "sunshadowmask.h"		// baked mask sidecar format (public/)
 
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
@@ -122,11 +123,14 @@ public:
 		m_nSunStyle = 0;
 		m_vecSunDirection.Init( 0, 0, -1 );
 		m_vecSunColor.Init( 1, 1, 1 );
+		m_bHasMask = false;
+		memset( &m_MaskHeader, 0, sizeof( m_MaskHeader ) );
 	}
 
 	virtual void LevelInitPostEntity()
 	{
 		ReadSunFromBSP();
+		LoadSunShadowMask();
 
 		if ( m_bHasSun )
 		{
@@ -139,8 +143,58 @@ public:
 	virtual void LevelShutdownPreEntity()
 	{
 		DestroySunShadow();
+		FreeSunShadowMask();
 		m_bHasSun = false;
 		m_nSunStyle = 0;
+	}
+
+	bool HasBakedMask() const { return m_bHasMask; }
+
+	//-----------------------------------------------------------------------------
+	// CPU sample of the baked mask at a world position. Returns baked sun
+	// visibility 0..1 (0 = in baked shadow / behind the sun-facing surface).
+	// This is the reference the shader will reproduce; also used by the probe cmd.
+	//-----------------------------------------------------------------------------
+	float GetBakedSunVisibility( const Vector &vecWorldPos ) const
+	{
+		if ( !m_bHasMask )
+			return 1.0f;
+
+		const SunShadowMaskHeader_t &h = m_MaskHeader;
+		Vector vSunDir( h.vecSunDir[0], h.vecSunDir[1], h.vecSunDir[2] );
+		Vector vOrigin( h.vecOrigin[0], h.vecOrigin[1], h.vecOrigin[2] );
+		Vector vU( h.vecAxisU[0], h.vecAxisU[1], h.vecAxisU[2] );
+		Vector vV( h.vecAxisV[0], h.vecAxisV[1], h.vecAxisV[2] );
+
+		Vector vRel = vecWorldPos - vOrigin;
+		float u = DotProduct( vRel, vU );
+		float v = DotProduct( vRel, vV );
+		float d = DotProduct( vRel, vSunDir );
+
+		float texU = ( u - h.flMinU ) / ( h.flMaxU - h.flMinU );
+		float texV = ( v - h.flMinV ) / ( h.flMaxV - h.flMinV );
+		if ( texU < 0.0f || texU > 1.0f || texV < 0.0f || texV > 1.0f )
+			return 1.0f;	// outside the baked region -- assume lit
+
+		float depthNorm = ( d - h.flMinDepth ) / ( h.flMaxDepth - h.flMinDepth );
+
+		int x = (int)( texU * ( h.nResolution - 1 ) + 0.5f );
+		int y = (int)( texV * ( h.nResolution - 1 ) + 0.5f );
+		const unsigned char *pTexel = &m_MaskData[ ( y * h.nResolution + x ) * 4 ];
+
+		float flVis = pTexel[0] / 255.0f;						// R = soft sun visibility
+		unsigned int usDepth = ( pTexel[1] << 8 ) | pTexel[2];	// G,B = 16-bit nearest depth
+		if ( usDepth == 0xFFFF )
+			return 1.0f;										// no surface recorded here
+		float flStoredDepth = usDepth / 65535.0f;
+
+		// If we're farther from the sun than the nearest recorded surface, we're
+		// behind it -> in static shadow. Otherwise this is the sun-facing surface.
+		const float flDepthBias = 2.0f / 65535.0f;
+		if ( depthNorm > flStoredDepth + flDepthBias )
+			return 0.0f;
+
+		return flVis;
 	}
 
 	virtual void Update( float frametime )
@@ -329,15 +383,142 @@ private:
 		}
 	}
 
+	//-----------------------------------------------------------------------------
+	// Load the VRAD-baked mask sidecar (maps/<name>.sunshadow) for this level.
+	//-----------------------------------------------------------------------------
+	void LoadSunShadowMask()
+	{
+		FreeSunShadowMask();
+
+		const char *pszLevelName = engine->GetLevelName();		// "maps/foo.bsp"
+		if ( !pszLevelName || !pszLevelName[0] )
+			return;
+
+		char szName[MAX_PATH];
+		Q_StripExtension( pszLevelName, szName, sizeof( szName ) );
+		Q_strncat( szName, ".sunshadow", sizeof( szName ), COPY_ALL_CHARACTERS );
+
+		FileHandle_t hFile = filesystem->Open( szName, "rb", "GAME" );
+		if ( hFile == FILESYSTEM_INVALID_HANDLE )
+		{
+			DevMsg( "Sun shadowmask: no baked mask '%s' (bake with vrad -sunshadowmask).\n", szName );
+			return;
+		}
+
+		SunShadowMaskHeader_t hdr;
+		if ( filesystem->Read( &hdr, sizeof( hdr ), hFile ) != sizeof( hdr ) ||
+			 hdr.nMagic != SUNSHADOWMASK_MAGIC || hdr.nVersion != SUNSHADOWMASK_VERSION ||
+			 hdr.nResolution < 1 || hdr.nResolution > 8192 )
+		{
+			Warning( "Sun shadowmask: '%s' is not a valid mask (magic/version/res).\n", szName );
+			filesystem->Close( hFile );
+			return;
+		}
+
+		int nBytes = hdr.nResolution * hdr.nResolution * 4;
+		m_MaskData.EnsureCapacity( nBytes );
+		if ( filesystem->Read( m_MaskData.Base(), nBytes, hFile ) != nBytes )
+		{
+			Warning( "Sun shadowmask: '%s' truncated.\n", szName );
+			filesystem->Close( hFile );
+			m_MaskData.Purge();
+			return;
+		}
+		filesystem->Close( hFile );
+
+		m_MaskHeader = hdr;
+		m_bHasMask = true;
+		CreateMaskTexture();
+
+		DevMsg( "Sun shadowmask: loaded %s (%dx%d).\n", szName, hdr.nResolution, hdr.nResolution );
+	}
+
+	void FreeSunShadowMask()
+	{
+		m_MaskTexture.Shutdown();
+		m_MaskData.Purge();
+		m_bHasMask = false;
+		memset( &m_MaskHeader, 0, sizeof( m_MaskHeader ) );
+	}
+
+	void CreateMaskTexture();
+
 	ClientShadowHandle_t	m_ShadowHandle;
 	CTextureReference		m_CookieTexture;
 	Vector					m_vecSunDirection;	// direction the sunlight travels (points down)
 	Vector					m_vecSunColor;		// normalized hue from the BSP skylight
 	int						m_nSunStyle;		// lightstyle VRAD baked the skylight with
 	bool					m_bHasSun;
+
+	// Baked sun-visibility mask (sun-projection space), loaded from the sidecar.
+	bool					m_bHasMask;
+	SunShadowMaskHeader_t	m_MaskHeader;
+	CUtlMemory<unsigned char> m_MaskData;		// nRes*nRes*4, BGRA-order (R=vis, GB=depth)
+	CTextureReference		m_MaskTexture;		// GPU copy for the shader (Stage 3)
 };
 
 static CSunlightShadowManager s_SunlightShadowManager;
+
+//-----------------------------------------------------------------------------
+// Uploads the baked mask into a GPU texture the world shader will sample in
+// Stage 3. Packs so the shader reads: .r = sun visibility, .g/.b = 16-bit
+// nearest depth (high/low byte). Texture is IMAGE_FORMAT_BGRA8888, whose in-
+// memory order is B,G,R,A.
+//-----------------------------------------------------------------------------
+class CSunMaskRegenerator : public ITextureRegenerator
+{
+public:
+	CSunMaskRegenerator() : m_pData( NULL ), m_nRes( 0 ) {}
+	void Set( const unsigned char *pData, int nRes ) { m_pData = pData; m_nRes = nRes; }
+
+	virtual void RegenerateTextureBits( ITexture *pTexture, IVTFTexture *pVTFTexture, Rect_t *pRect )
+	{
+		if ( !m_pData )
+			return;
+		int w = pVTFTexture->Width();
+		int h = pVTFTexture->Height();
+		unsigned char *pDst = pVTFTexture->ImageData( 0, 0, 0 );
+		for ( int y = 0; y < h; ++y )
+		{
+			for ( int x = 0; x < w; ++x )
+			{
+				const unsigned char *pSrc = &m_pData[ ( y * m_nRes + x ) * 4 ];	// [vis, depthHi, depthLo, 255]
+				unsigned char *p = pDst + ( y * w + x ) * 4;					// BGRA
+				p[0] = pSrc[2];		// B <- depthLo
+				p[1] = pSrc[1];		// G <- depthHi
+				p[2] = pSrc[0];		// R <- visibility
+				p[3] = 255;
+			}
+		}
+	}
+	virtual void Release() {}
+
+private:
+	const unsigned char *m_pData;
+	int m_nRes;
+};
+
+static CSunMaskRegenerator s_SunMaskRegen;
+
+void CSunlightShadowManager::CreateMaskTexture()
+{
+	m_MaskTexture.Shutdown();
+	if ( !m_bHasMask )
+		return;
+
+	int nRes = m_MaskHeader.nResolution;
+	s_SunMaskRegen.Set( m_MaskData.Base(), nRes );
+
+	m_MaskTexture.InitProceduralTexture( "sunshadowmask_baked", TEXTURE_GROUP_CLIENT_EFFECTS,
+		nRes, nRes, IMAGE_FORMAT_BGRA8888,
+		TEXTUREFLAGS_CLAMPS | TEXTUREFLAGS_CLAMPT | TEXTUREFLAGS_NOMIP |
+		TEXTUREFLAGS_NOLOD | TEXTUREFLAGS_SINGLECOPY | TEXTUREFLAGS_PROCEDURAL );
+	if ( m_MaskTexture.IsValid() )
+	{
+		m_MaskTexture->SetTextureRegenerator( &s_SunMaskRegen );
+		m_MaskTexture->Download();
+	}
+}
 
 //-----------------------------------------------------------------------------
 // Debug info
@@ -366,6 +547,9 @@ CON_COMMAND( r_sunshadow_info, "Prints sun shadowmap status for the current map.
 		Msg( "  skylight lightstyle 0: sun contribution is merged into the base lightmap (no separate shadowmask data).\n" );
 	}
 
+	Msg( "  baked mask: %s\n", s_SunlightShadowManager.HasBakedMask()
+		? "loaded (maps/<name>.sunshadow)" : "none (bake with vrad -sunshadowmask)" );
+
 	if ( !materials->SupportsShadowDepthTextures() )
 	{
 		Msg( "  WARNING: hardware/dxlevel does not support shadow depth textures; feature inactive.\n" );
@@ -374,4 +558,27 @@ CON_COMMAND( r_sunshadow_info, "Prints sun shadowmap status for the current map.
 	{
 		Msg( "  WARNING: r_flashlightdepthtexture is 0; feature inactive.\n" );
 	}
+}
+
+//-----------------------------------------------------------------------------
+// Probe the baked mask at the local player's feet (verifies load + projection
+// + sampling independently of the shader). Compare against the _sunshadow.tga.
+//-----------------------------------------------------------------------------
+CON_COMMAND( r_sunshadow_probe, "Prints the baked sun visibility at the player's position." )
+{
+	if ( !s_SunlightShadowManager.HasBakedMask() )
+	{
+		Msg( "Sun shadowmask: no baked mask loaded for this map.\n" );
+		return;
+	}
+
+	C_BasePlayer *pPlayer = C_BasePlayer::GetLocalPlayer();
+	if ( !pPlayer )
+		return;
+
+	Vector vFeet = pPlayer->GetAbsOrigin();
+	Vector vEyes = pPlayer->EyePosition();
+	Msg( "Sun baked visibility: feet %.2f, eyes %.2f  (1 = full sun, 0 = baked shadow)\n",
+		s_SunlightShadowManager.GetBakedSunVisibility( vFeet ),
+		s_SunlightShadowManager.GetBakedSunVisibility( vEyes ) );
 }
