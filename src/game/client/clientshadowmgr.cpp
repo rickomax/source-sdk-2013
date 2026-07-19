@@ -104,8 +104,24 @@ ConVar r_flashlightdepthres( "r_flashlightdepthres", "1024" );
 // a reallocation via the change callback below.
 static void SunShadowDepthResChanged( IConVar *pVar, const char *pOldValue, float flOldValue );
 ConVar r_sunshadow_depthres( "r_sunshadow_depthres", "2048", FCVAR_ARCHIVE,
-	"Resolution of the sun shadowmap depth texture. 0 disables the dedicated texture (the sun then competes with the flashlight for the shared pool).",
+	"Resolution of the sun shadowmap depth textures (shared default for all cascades). 0 disables the dedicated textures (the sun then competes with the flashlight for the shared pool).",
 	SunShadowDepthResChanged );
+
+// Per-cascade depth resolution overrides (0 = use r_sunshadow_depthres). Defined
+// here because this is where the render targets are allocated; the sun manager
+// mirrors them for the projection state. Changing any reallocates the textures.
+ConVar r_sunshadow_c0_res( "r_sunshadow_c0_res", "0", FCVAR_ARCHIVE, "Depth resolution override for sun cascade 0 (near); 0 = r_sunshadow_depthres.", SunShadowDepthResChanged );
+ConVar r_sunshadow_c1_res( "r_sunshadow_c1_res", "0", FCVAR_ARCHIVE, "Depth resolution override for sun cascade 1 (mid); 0 = r_sunshadow_depthres.", SunShadowDepthResChanged );
+ConVar r_sunshadow_c2_res( "r_sunshadow_c2_res", "0", FCVAR_ARCHIVE, "Depth resolution override for sun cascade 2 (far); 0 = r_sunshadow_depthres.", SunShadowDepthResChanged );
+static ConVar *s_pSunCascadeRes[MAX_SUN_SHADOW_CASCADES] = { &r_sunshadow_c0_res, &r_sunshadow_c1_res, &r_sunshadow_c2_res };
+COMPILE_TIME_ASSERT( MAX_SUN_SHADOW_CASCADES == 3 );
+
+// Resolution actually used for cascade c: its override, else the shared default.
+static int SunCascadeDepthRes( int c )
+{
+	int nRes = s_pSunCascadeRes[c]->GetInt();
+	return ( nRes > 0 ) ? nRes : r_sunshadow_depthres.GetInt();
+}
 
 ConVar r_threaded_client_shadow_manager( "r_threaded_client_shadow_manager", "0" );
 
@@ -1029,7 +1045,10 @@ IClientShadowMgr* g_pClientShadowMgr = &s_ClientShadowMgr;
 //-----------------------------------------------------------------------------
 static void SunShadowDepthResChanged( IConVar *pVar, const char *pOldValue, float flOldValue )
 {
-	if ( r_sunshadow_depthres.GetInt() == (int)flOldValue )
+	// Shared by r_sunshadow_depthres and the per-cascade overrides; reallocate
+	// only when the changed cvar's value actually differs.
+	ConVarRef ref( pVar );
+	if ( ref.GetInt() == (int)flOldValue )
 		return;
 
 	s_ClientShadowMgr.ReallocateDepthTextures();
@@ -1439,30 +1458,36 @@ void CClientShadowMgr::InitDepthTextureShadows()
 			m_DepthTextureCacheLocks.AddToTail( bFalse );
 		}
 
-		// Dedicated depth textures for the orthographic sun shadow cascades, at
-		// their own resolution. The PC pool above only has one entry, which the
-		// player's flashlight uses; each sun cascade gets its own so sun + player
-		// flashlight (and the cascades with each other) can all shadow at once.
-		// The dummy color RT is shared -- it is write-only scratch during the
-		// depth pass, so the cascades can reuse one.
-		int nSunRes = r_sunshadow_depthres.GetInt();
-		if ( nSunRes > 0 )
+		// Dedicated depth textures for the orthographic sun shadow cascades, each
+		// at its own resolution (per-cascade override or r_sunshadow_depthres). The
+		// PC pool above only has one entry, which the player's flashlight uses; each
+		// sun cascade gets its own so sun + player flashlight (and the cascades with
+		// each other) can all shadow at once. The dummy color RT is shared write-
+		// only scratch during the depth pass, so it just needs to be at least as
+		// large as the biggest cascade.
+		int nMaxSunRes = 0;
+		for ( int c = 0; c < MAX_SUN_SHADOW_CASCADES; ++c )
+			nMaxSunRes = MAX( nMaxSunRes, SunCascadeDepthRes( c ) );
+		if ( nMaxSunRes > 0 )
 		{
 #if defined( _X360 )
-			m_SunShadowDummyColorTexture.InitRenderTargetTexture( nSunRes, nSunRes, RT_SIZE_OFFSCREEN, IMAGE_FORMAT_BGR565, MATERIAL_RT_DEPTH_SHARED, false, "_rt_SunShadowDummy" );
-			m_SunShadowDummyColorTexture.InitRenderTargetSurface( nSunRes, nSunRes, IMAGE_FORMAT_BGR565, true );
+			m_SunShadowDummyColorTexture.InitRenderTargetTexture( nMaxSunRes, nMaxSunRes, RT_SIZE_OFFSCREEN, IMAGE_FORMAT_BGR565, MATERIAL_RT_DEPTH_SHARED, false, "_rt_SunShadowDummy" );
+			m_SunShadowDummyColorTexture.InitRenderTargetSurface( nMaxSunRes, nMaxSunRes, IMAGE_FORMAT_BGR565, true );
 #else
-			m_SunShadowDummyColorTexture.InitRenderTarget( nSunRes, nSunRes, RT_SIZE_OFFSCREEN, nullFormat, MATERIAL_RT_DEPTH_NONE, false, "_rt_SunShadowDummy" );
+			m_SunShadowDummyColorTexture.InitRenderTarget( nMaxSunRes, nMaxSunRes, RT_SIZE_OFFSCREEN, nullFormat, MATERIAL_RT_DEPTH_NONE, false, "_rt_SunShadowDummy" );
 #endif
 			for ( int c = 0; c < MAX_SUN_SHADOW_CASCADES; ++c )
 			{
+				int nRes = SunCascadeDepthRes( c );
+				if ( nRes <= 0 )
+					continue;	// this cascade is disabled; it will fall back to the pool
 				char szName[64];
 				Q_snprintf( szName, sizeof( szName ), "_rt_SunShadowDepth%d", c );
 #if defined( _X360 )
-				m_SunShadowDepthTexture[c].InitRenderTargetTexture( nSunRes, nSunRes, RT_SIZE_OFFSCREEN, dstFormat, MATERIAL_RT_DEPTH_NONE, false, szName );
+				m_SunShadowDepthTexture[c].InitRenderTargetTexture( nRes, nRes, RT_SIZE_OFFSCREEN, dstFormat, MATERIAL_RT_DEPTH_NONE, false, szName );
 				m_SunShadowDepthTexture[c].InitRenderTargetSurface( 1, 1, dstFormat, false );
 #else
-				m_SunShadowDepthTexture[c].InitRenderTarget( nSunRes, nSunRes, RT_SIZE_OFFSCREEN, dstFormat, MATERIAL_RT_DEPTH_NONE, false, szName );
+				m_SunShadowDepthTexture[c].InitRenderTarget( nRes, nRes, RT_SIZE_OFFSCREEN, dstFormat, MATERIAL_RT_DEPTH_NONE, false, szName );
 #endif
 			}
 		}

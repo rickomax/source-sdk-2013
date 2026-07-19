@@ -64,6 +64,33 @@ static ConVar r_sunshadow_cascade_ratio( "r_sunshadow_cascade_ratio", "4.0", FCV
 	"Radius ratio between adjacent sun shadow cascades. r_sunshadow_distance is the outermost cascade; each finer one is this many times smaller (and that much sharper)." );
 static ConVar r_sunshadow_cascade_blend( "r_sunshadow_cascade_blend", "0.15", FCVAR_ARCHIVE,
 	"Fraction of each cascade over which it crossfades into the next, hiding the seam between cascades (0..0.5)." );
+static ConVar r_sunshadow_cascade_debug( "r_sunshadow_cascade_debug", "0", FCVAR_CHEAT,
+	"Tint each sun cascade a distinct colour (red/green/blue = near/mid/far) to see coverage and the crossfade overlaps." );
+
+//-----------------------------------------------------------------------------
+// Per-cascade overrides. Each defaults to a sentinel meaning "use the shared/
+// derived value", so the globals above still drive everything out of the box;
+// set a cascade's cvar to tune just that ring. Cascade 0 is the sharp near one.
+// (Resolution overrides live in clientshadowmgr, next to the RT allocation.)
+//-----------------------------------------------------------------------------
+#define SUN_PERCASCADE_CVAR( base, dflt, help ) \
+	static ConVar r_sunshadow_c0_##base( "r_sunshadow_c0_" #base, dflt, FCVAR_ARCHIVE, "Cascade 0 (near) " help ); \
+	static ConVar r_sunshadow_c1_##base( "r_sunshadow_c1_" #base, dflt, FCVAR_ARCHIVE, "Cascade 1 (mid) " help ); \
+	static ConVar r_sunshadow_c2_##base( "r_sunshadow_c2_" #base, dflt, FCVAR_ARCHIVE, "Cascade 2 (far) " help ); \
+	static ConVar *s_pCascade_##base[3] = { &r_sunshadow_c0_##base, &r_sunshadow_c1_##base, &r_sunshadow_c2_##base };
+
+SUN_PERCASCADE_CVAR( dist,       "0",  "radius override (0 = auto from r_sunshadow_distance / ratio)." )
+SUN_PERCASCADE_CVAR( filter,     "-1", "shadow filter size override (<0 = use r_sunshadow_filter)." )
+SUN_PERCASCADE_CVAR( depthbias,  "-1", "shadow depth bias override (<0 = use r_sunshadow_depthbias)." )
+SUN_PERCASCADE_CVAR( slopescale, "-1", "shadow slope-scale bias override (<0 = use r_sunshadow_slopescale)." )
+
+// Depth-texture resolution overrides are defined in clientshadowmgr.cpp (which
+// owns the render-target allocation); mirror them here for the projection state.
+extern ConVar r_sunshadow_c0_res, r_sunshadow_c1_res, r_sunshadow_c2_res;
+static ConVar *s_pCascade_res[3] = { &r_sunshadow_c0_res, &r_sunshadow_c1_res, &r_sunshadow_c2_res };
+
+// The per-cascade cvar arrays above are hand-written for exactly 3 cascades.
+COMPILE_TIME_ASSERT( MAX_SUN_SHADOW_CASCADES == 3 );
 
 //-----------------------------------------------------------------------------
 // Per-cascade procedural cookie (a "ring"). The flashlight pass multiplies the
@@ -159,8 +186,10 @@ public:
 	CSunlightShadowManager() : CAutoGameSystemPerFrame( "CSunlightShadowManager" )
 	{
 		for ( int c = 0; c < MAX_SUN_SHADOW_CASCADES; ++c )
+		{
 			m_ShadowHandle[c] = CLIENTSHADOW_INVALID_HANDLE;
-		m_flLastRatio = -1.0f;		// force cookie generation on the first update
+			m_flLastRadius[c] = -1.0f;	// force cookie generation on the first update
+		}
 		m_flLastBlend = -1.0f;
 		m_bHasSun = false;
 		m_nSunStyle = 0;
@@ -370,11 +399,10 @@ private:
 		filesystem->Close( hFile );
 	}
 
-	// (Re)build cascade c's ring cookie. The normalized handoff bands depend only
-	// on the cascade ratio and blend fraction (not the absolute distance), so we
-	// only regenerate when those change. Cascade 0 has a solid center (no finer
-	// cascade below it); every cascade fades out over its outer band.
-	void InitCookieTexture( int c, float flRatio, float flBlend )
+	// (Re)build cascade c's ring cookie. flInnerHi is the normalized radius of the
+	// inner handoff (= R[c-1]/R[c]); pass 0 for cascade 0 (solid center, no finer
+	// cascade below it). Every cascade fades out over its outer band.
+	void InitCookieTexture( int c, float flInnerHi, float flBlend )
 	{
 		if ( !m_CookieTexture[c].IsValid() )
 		{
@@ -390,13 +418,19 @@ private:
 		if ( !m_CookieTexture[c].IsValid() )
 			return;
 
-		// Inner handoff (to the finer cascade) sits at radius R[c-1] = R[c]/ratio;
-		// outer handoff at the cascade's own edge. Cascade 0 has no inner band.
-		float flInvRatio = ( flRatio > 1.0f ) ? 1.0f / flRatio : 0.0f;
-		float flInnerHi = ( c > 0 ) ? flInvRatio : 0.0f;
-		float flInnerLo = ( c > 0 ) ? flInvRatio * ( 1.0f - flBlend ) : 0.0f;
+		// Inner handoff (to the finer cascade) sits at radius R[c-1] = flInnerHi*R[c];
+		// outer handoff at the cascade's own edge. Cascade 0 passes flInnerHi 0.
+		float flInnerLo = flInnerHi * ( 1.0f - flBlend );
 		m_CookieRegen[c].SetBands( flInnerLo, flInnerHi, 1.0f - flBlend, 1.0f );
 		m_CookieTexture[c]->Download();
+	}
+
+	// Depth-texture resolution actually allocated for cascade c (override, else
+	// the shared r_sunshadow_depthres). Kept in sync with clientshadowmgr.
+	static int CascadeRes( int c )
+	{
+		int nRes = s_pCascade_res[c]->GetInt();
+		return ( nRes > 0 ) ? nRes : MAX( r_sunshadow_depthres.GetInt(), 1 );
 	}
 
 	void UpdateSunShadow( const Vector &vecPlayerEyes )
@@ -405,14 +439,41 @@ private:
 		float flOuterRadius = MAX( r_sunshadow_distance.GetFloat(), 256.0f );
 		float flRatio = clamp( r_sunshadow_cascade_ratio.GetFloat(), 1.5f, 16.0f );
 		float flBlend = clamp( r_sunshadow_cascade_blend.GetFloat(), 0.02f, 0.5f );
-		int nDepthRes = MAX( r_sunshadow_depthres.GetInt(), 1 );
 
-		// Regenerate cookies only when the cascade shape actually changed.
-		if ( flRatio != m_flLastRatio || flBlend != m_flLastBlend )
+		// Per-cascade radius: an explicit override, else auto from distance/ratio
+		// (cascade nCascades-1 is the outermost).
+		float flRadii[MAX_SUN_SHADOW_CASCADES];
+		for ( int c = 0; c < nCascades; ++c )
+		{
+			float flOverride = s_pCascade_dist[c]->GetFloat();
+			if ( flOverride > 0.0f )
+			{
+				flRadii[c] = flOverride;
+			}
+			else
+			{
+				flRadii[c] = flOuterRadius;
+				for ( int k = c; k < nCascades - 1; ++k )
+					flRadii[c] /= flRatio;
+			}
+			flRadii[c] = MAX( flRadii[c], 16.0f );
+		}
+
+		// Regenerate the ring cookies only when the cascade shape changed; the
+		// bands come from the ACTUAL adjacent radii so arbitrary per-cascade
+		// distances still tile without gaps or double-brightening.
+		bool bShapeChanged = ( flBlend != m_flLastBlend );
+		for ( int c = 0; c < nCascades; ++c )
+			bShapeChanged = bShapeChanged || ( flRadii[c] != m_flLastRadius[c] );
+		if ( bShapeChanged )
 		{
 			for ( int c = 0; c < nCascades; ++c )
-				InitCookieTexture( c, flRatio, flBlend );
-			m_flLastRatio = flRatio;
+			{
+				float flInnerHi = ( c > 0 && flRadii[c] > 0.0f ) ?
+					clamp( flRadii[c - 1] / flRadii[c], 0.0f, 1.0f ) : 0.0f;
+				InitCookieTexture( c, flInnerHi, flBlend );
+				m_flLastRadius[c] = flRadii[c];
+			}
 			m_flLastBlend = flBlend;
 		}
 
@@ -422,14 +483,13 @@ private:
 		Vector vecFwd, vecRight, vecUp;
 		AngleVectors( angSun, &vecFwd, &vecRight, &vecUp );
 
+		bool bDebug = r_sunshadow_cascade_debug.GetBool();
+		float flIntensity = r_sunshadow_intensity.GetFloat();
+
 		for ( int c = 0; c < nCascades; ++c )
 		{
-			// Cascade c radius: outermost = r_sunshadow_distance, each finer one
-			// is 'ratio' times smaller. (c = nCascades-1 is the outer cascade.)
-			float flRadius = flOuterRadius;
-			for ( int k = c; k < nCascades - 1; ++k )
-				flRadius /= flRatio;
-
+			float flRadius = flRadii[c];
+			int nDepthRes = CascadeRes( c );
 			float flCasterHeight = MAX( r_sunshadow_casterheight.GetFloat(), flRadius );
 
 			// Cookies are (re)generated above only when the cascade shape changes.
@@ -455,10 +515,13 @@ private:
 
 			// All cascades share the same sun colour x intensity; the ring cookies
 			// keep the total additive contribution at 1x across their overlaps.
-			float flIntensity = r_sunshadow_intensity.GetFloat();
-			state.m_Color[0] = m_vecSunColor.x * flIntensity;
-			state.m_Color[1] = m_vecSunColor.y * flIntensity;
-			state.m_Color[2] = m_vecSunColor.z * flIntensity;
+			// The debug mode instead tints each cascade to reveal its coverage.
+			Vector vecTint = m_vecSunColor;
+			if ( bDebug )
+				vecTint.Init( c == 0 ? 1.0f : 0.0f, c == 1 ? 1.0f : 0.0f, c >= 2 ? 1.0f : 0.0f );
+			state.m_Color[0] = vecTint.x * flIntensity;
+			state.m_Color[1] = vecTint.y * flIntensity;
+			state.m_Color[2] = vecTint.z * flIntensity;
 			state.m_Color[3] = 0.0f;
 
 			state.m_NearZ = 16.0f;
@@ -472,11 +535,18 @@ private:
 			state.m_pSpotlightTexture = m_CookieTexture[c];
 			state.m_nSpotlightTextureFrame = 0;
 
+			// Per-cascade shadow quality: override, else the shared value. A coarse
+			// far cascade usually wants a bigger bias and softer filter than the
+			// sharp near one.
+			float flFilter = s_pCascade_filter[c]->GetFloat();
+			float flDepthBias = s_pCascade_depthbias[c]->GetFloat();
+			float flSlope = s_pCascade_slopescale[c]->GetFloat();
+
 			state.m_bEnableShadows = true;
 			state.m_flShadowMapResolution = nDepthRes;
-			state.m_flShadowFilterSize = r_sunshadow_filter.GetFloat();
-			state.m_flShadowSlopeScaleDepthBias = r_sunshadow_slopescale.GetFloat();
-			state.m_flShadowDepthBias = r_sunshadow_depthbias.GetFloat();
+			state.m_flShadowFilterSize = ( flFilter >= 0.0f ) ? flFilter : r_sunshadow_filter.GetFloat();
+			state.m_flShadowSlopeScaleDepthBias = ( flSlope >= 0.0f ) ? flSlope : r_sunshadow_slopescale.GetFloat();
+			state.m_flShadowDepthBias = ( flDepthBias >= 0.0f ) ? flDepthBias : r_sunshadow_depthbias.GetFloat();
 			state.m_flShadowAtten = 0.0f;
 
 			if ( m_ShadowHandle[c] == CLIENTSHADOW_INVALID_HANDLE )
@@ -637,7 +707,7 @@ private:
 	ClientShadowHandle_t	m_ShadowHandle[MAX_SUN_SHADOW_CASCADES];
 	CTextureReference		m_CookieTexture[MAX_SUN_SHADOW_CASCADES];
 	CSunShadowCookieRegenerator m_CookieRegen[MAX_SUN_SHADOW_CASCADES];
-	float					m_flLastRatio;		// cascade shape the cookies were built for
+	float					m_flLastRadius[MAX_SUN_SHADOW_CASCADES];	// cascade shape the cookies were built for
 	float					m_flLastBlend;
 	Vector					m_vecSunDirection;	// direction the sunlight travels (points down)
 	Vector					m_vecSunColor;		// normalized hue from the BSP skylight
