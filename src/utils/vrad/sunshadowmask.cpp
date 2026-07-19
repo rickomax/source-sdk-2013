@@ -16,6 +16,7 @@
 #include "mathlib/ssemath.h"
 #include "worldsize.h"
 #include "sunshadowmask.h"
+#include "imagepacker.h"
 #include "tier1/utlbuffer.h"
 #include "tier1/strtools.h"
 #include "filesystem.h"
@@ -24,6 +25,7 @@
 // Options set from the command line (vrad.cpp).
 bool g_bBuildSunShadowMask = false;
 bool g_bDumpSunShadowMask = false;
+bool g_bDumpLightmaps = false;
 int  g_nSunShadowMaskRes = 1024;
 
 //-----------------------------------------------------------------------------
@@ -304,4 +306,92 @@ void BuildSunShadowMask()
 		Msg( "-sunshadowmask: wrote debug image %s\n", szTGA );
 		free( pDebugBGR );
 	}
+}
+
+//-----------------------------------------------------------------------------
+// Packs the finished per-face lightmaps into TGA page(s) for inspection.
+// Reads the LDR lighting lump (pdlightdata) populated by FinalLightFace; each
+// face's style-0 block is decoded with VRAD's own ConvertRGBExp32ToRGBA8888
+// (the same gamma/colorspace the engine shows), and packed with CImagePacker
+// -- the very packer VBSP uses for lightmap pages. Enable with -dumplightmaps.
+//-----------------------------------------------------------------------------
+void DumpLightmapsToTGA()
+{
+	if ( !g_bDumpLightmaps )
+		return;
+
+	if ( !pdlightdata || pdlightdata->Count() == 0 )
+	{
+		Msg( "-dumplightmaps: no (LDR) lighting data in the bsp; nothing to dump.\n" );
+		return;
+	}
+
+	const int nPageSize = 1024;		// atlas page dimension
+	const int nPad = 1;				// gutter between faces
+
+	unsigned char *pImage = (unsigned char *)malloc( (size_t)nPageSize * nPageSize * 3 );
+	if ( !pImage )
+		return;
+
+	CImagePacker packer;
+	packer.Reset( nPageSize, nPageSize );
+	memset( pImage, 0, (size_t)nPageSize * nPageSize * 3 );
+
+	char szBase[1024];
+	Q_StripExtension( source, szBase, sizeof( szBase ) );
+
+	int nPage = 0;
+	int nPacked = 0;
+
+	for ( int f = 0; f < numfaces; ++f )
+	{
+		dface_t *pFace = &dfaces[f];
+		if ( pFace->lightofs == -1 )
+			continue;
+
+		int w = pFace->m_LightmapTextureSizeInLuxels[0] + 1;
+		int h = pFace->m_LightmapTextureSizeInLuxels[1] + 1;
+		if ( w <= 0 || h <= 0 || w > nPageSize || h > nPageSize )
+			continue;
+
+		int px = 0, py = 0;
+		if ( !packer.AddBlock( w + nPad, h + nPad, &px, &py ) )
+		{
+			// Page is full: write it out and open a fresh one.
+			char szName[1024];
+			Q_snprintf( szName, sizeof( szName ), "%s_lightmap%d.tga", szBase, nPage );
+			WriteDebugTGA( szName, pImage, nPageSize, nPageSize );
+			Msg( "-dumplightmaps: wrote %s\n", szName );
+
+			++nPage;
+			packer.Reset( nPageSize, nPageSize );
+			memset( pImage, 0, (size_t)nPageSize * nPageSize * 3 );
+			if ( !packer.AddBlock( w + nPad, h + nPad, &px, &py ) )
+				continue;
+		}
+
+		// Style 0, first w*h luxels (the flat lightmap for bumped faces too).
+		const ColorRGBExp32 *pLuxels = (const ColorRGBExp32 *)&(*pdlightdata)[pFace->lightofs];
+		for ( int y = 0; y < h; ++y )
+		{
+			for ( int x = 0; x < w; ++x )
+			{
+				unsigned char rgba[4];
+				ConvertRGBExp32ToRGBA8888( &pLuxels[y * w + x], rgba );
+
+				unsigned char *pPixel = pImage + ( (size_t)( py + y ) * nPageSize + ( px + x ) ) * 3;
+				pPixel[0] = rgba[2];	// B
+				pPixel[1] = rgba[1];	// G
+				pPixel[2] = rgba[0];	// R
+			}
+		}
+		++nPacked;
+	}
+
+	char szName[1024];
+	Q_snprintf( szName, sizeof( szName ), "%s_lightmap%d.tga", szBase, nPage );
+	WriteDebugTGA( szName, pImage, nPageSize, nPageSize );
+	Msg( "-dumplightmaps: wrote %s (%d faces across %d page(s))\n", szName, nPacked, nPage + 1 );
+
+	free( pImage );
 }

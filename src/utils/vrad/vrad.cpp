@@ -2091,9 +2091,11 @@ bool RadWorld_Go()
 
 	// Bake the sun shadowmask sidecar (opt-in via -sunshadowmask). The ray-trace
 	// environment and the sun light are both live here; only the master needs it.
+	// Optionally dump the finished lightmaps to TGA (-dumplightmaps).
 	if ( !g_bUseMPI || g_bMPIMaster )
 	{
 		BuildSunShadowMask();
+		DumpLightmapsToTGA();
 	}
 
 	return true;
@@ -2402,6 +2404,10 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 			{
 				g_nSunShadowMaskRes = atoi( argv[i] );
 			}
+		}
+		else if ( !Q_stricmp( argv[i], "-dumplightmaps" ) )
+		{
+			g_bDumpLightmaps = true;
 		}
 		else if ( !strcmp(argv[i], "-dump") )
 		{
