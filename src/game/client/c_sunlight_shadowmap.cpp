@@ -45,7 +45,7 @@ extern ConVar r_sunshadow_depthres;		// lives in clientshadowmgr.cpp next to the
 static ConVar r_sunshadow( "r_sunshadow", "1", FCVAR_ARCHIVE,
 	"Enable dynamic shadowmapped sunlight around the player (requires a map with a light_environment)." );
 static ConVar r_sunshadow_distance( "r_sunshadow_distance", "2048", FCVAR_ARCHIVE,
-	"Distance from the player at which the sun shadowmap ends. The outer 25% is a fade band blending back to the baked lightmap." );
+	"Radius of the OUTERMOST sun shadow cascade (where dynamic sun shadows end). Finer cascades are r_sunshadow_cascade_ratio times smaller and sharper; the outer edge fades back to the baked lightmap." );
 static ConVar r_sunshadow_intensity( "r_sunshadow_intensity", "1.0", FCVAR_ARCHIVE,
 	"Brightness multiplier for the dynamic sunlight (color comes from the map's light_environment)." );
 static ConVar r_sunshadow_casterheight( "r_sunshadow_casterheight", "8192", 0,
@@ -60,20 +60,44 @@ static ConVar r_sunshadow_darkness( "r_sunshadow_darkness", "0.35", FCVAR_ARCHIV
 	"How dark a fully dynamically-shadowed but baked-lit surface goes (0 = black, 1 = no darkening). Only affects surfaces the darkening world shader touches." );
 static ConVar r_sunshadow_worldshader( "r_sunshadow_worldshader", "1", FCVAR_ARCHIVE,
 	"Publish sun shadow parameters to the darkening world shader (requires the mod's game_shader_dx9 override of LightmappedGeneric)." );
+static ConVar r_sunshadow_cascade_ratio( "r_sunshadow_cascade_ratio", "4.0", FCVAR_ARCHIVE,
+	"Radius ratio between adjacent sun shadow cascades. r_sunshadow_distance is the outermost cascade; each finer one is this many times smaller (and that much sharper)." );
+static ConVar r_sunshadow_cascade_blend( "r_sunshadow_cascade_blend", "0.15", FCVAR_ARCHIVE,
+	"Fraction of each cascade over which it crossfades into the next, hiding the seam between cascades (0..0.5)." );
 
 //-----------------------------------------------------------------------------
-// Procedural cookie: white core with a smooth falloff to black over the outer
-// band. The flashlight pass multiplies by this texture, which gives us the
-// spatial blend from dynamic sunlight back to pure baked lighting at the edge
-// of the shadowed region. Chebyshev (max-norm) distance keeps the fade band a
-// constant width along each side of the square ortho projection.
+// Per-cascade procedural cookie (a "ring"). The flashlight pass multiplies the
+// added sunlight by this, so the cookie shapes where each cascade contributes:
+//   * transparent in the inner region a finer cascade already covers,
+//   * ramps up over the inner handoff band,
+//   * fully lit through the cascade's own annulus,
+//   * ramps back down over the outer handoff band to the next-coarser cascade.
+// The inner ramp of a cascade and the outer ramp of the finer one occupy the
+// same WORLD band and use complementary smoothsteps, so the cookies form a
+// partition of unity -- the added sun is exactly 1x everywhere, no double-
+// brightening on overlap and no dark gap. Chebyshev (max-norm) distance keeps
+// the bands a constant width along each side of the square ortho projection.
 //-----------------------------------------------------------------------------
 #define SUNSHADOW_COOKIE_RES		256
-#define SUNSHADOW_FADE_START		0.75f	// fade begins at 75% of r_sunshadow_distance
+
+static inline float SmoothStep01( float t )
+{
+	t = clamp( t, 0.0f, 1.0f );
+	return t * t * ( 3.0f - 2.0f * t );
+}
 
 class CSunShadowCookieRegenerator : public ITextureRegenerator
 {
 public:
+	CSunShadowCookieRegenerator() : m_flInnerLo( 0 ), m_flInnerHi( 0 ), m_flOuterLo( 0.75f ), m_flOuterHi( 1.0f ) {}
+
+	// Thresholds are normalized Chebyshev distance [0,1] (1 = cascade edge).
+	void SetBands( float flInnerLo, float flInnerHi, float flOuterLo, float flOuterHi )
+	{
+		m_flInnerLo = flInnerLo; m_flInnerHi = flInnerHi;
+		m_flOuterLo = flOuterLo; m_flOuterHi = flOuterHi;
+	}
+
 	virtual void RegenerateTextureBits( ITexture *pTexture, IVTFTexture *pVTFTexture, Rect_t *pRect )
 	{
 		int nWidth = pVTFTexture->Width();
@@ -90,15 +114,24 @@ public:
 				float flDist = MAX( fabsf( fx ), fabsf( fy ) );
 
 				float flIntensity;
-				if ( flDist <= SUNSHADOW_FADE_START )
+				if ( m_flInnerHi > 0.0f && flDist < m_flInnerHi )
+				{
+					// Inner handoff: transparent below inner_lo, ramp up to 1.
+					flIntensity = ( flDist <= m_flInnerLo ) ? 0.0f :
+						SmoothStep01( ( flDist - m_flInnerLo ) / ( m_flInnerHi - m_flInnerLo ) );
+				}
+				else if ( flDist <= m_flOuterLo )
 				{
 					flIntensity = 1.0f;
 				}
+				else if ( flDist < m_flOuterHi )
+				{
+					// Outer handoff: ramp 1 -> 0 to the next-coarser cascade.
+					flIntensity = 1.0f - SmoothStep01( ( flDist - m_flOuterLo ) / ( m_flOuterHi - m_flOuterLo ) );
+				}
 				else
 				{
-					float t = ( flDist - SUNSHADOW_FADE_START ) / ( 1.0f - SUNSHADOW_FADE_START );
-					t = clamp( t, 0.0f, 1.0f );
-					flIntensity = 1.0f - ( t * t * ( 3.0f - 2.0f * t ) );	// smoothstep down
+					flIntensity = 0.0f;
 				}
 
 				unsigned char v = (unsigned char)( flIntensity * 255.0f + 0.5f );
@@ -112,9 +145,10 @@ public:
 	}
 
 	virtual void Release() {}
-};
 
-static CSunShadowCookieRegenerator s_SunShadowCookieRegen;
+private:
+	float m_flInnerLo, m_flInnerHi, m_flOuterLo, m_flOuterHi;
+};
 
 //-----------------------------------------------------------------------------
 // The sun shadow manager
@@ -124,7 +158,10 @@ class CSunlightShadowManager : public CAutoGameSystemPerFrame
 public:
 	CSunlightShadowManager() : CAutoGameSystemPerFrame( "CSunlightShadowManager" )
 	{
-		m_ShadowHandle = CLIENTSHADOW_INVALID_HANDLE;
+		for ( int c = 0; c < MAX_SUN_SHADOW_CASCADES; ++c )
+			m_ShadowHandle[c] = CLIENTSHADOW_INVALID_HANDLE;
+		m_flLastRatio = -1.0f;		// force cookie generation on the first update
+		m_flLastBlend = -1.0f;
 		m_bHasSun = false;
 		m_nSunStyle = 0;
 		m_vecSunDirection.Init( 0, 0, -1 );
@@ -333,101 +370,140 @@ private:
 		filesystem->Close( hFile );
 	}
 
-	void InitCookieTexture()
+	// (Re)build cascade c's ring cookie. The normalized handoff bands depend only
+	// on the cascade ratio and blend fraction (not the absolute distance), so we
+	// only regenerate when those change. Cascade 0 has a solid center (no finer
+	// cascade below it); every cascade fades out over its outer band.
+	void InitCookieTexture( int c, float flRatio, float flBlend )
 	{
-		if ( m_CookieTexture.IsValid() )
+		if ( !m_CookieTexture[c].IsValid() )
+		{
+			char szName[64];
+			Q_snprintf( szName, sizeof( szName ), "sunshadow_cookie%d", c );
+			m_CookieTexture[c].InitProceduralTexture( szName, TEXTURE_GROUP_CLIENT_EFFECTS,
+				SUNSHADOW_COOKIE_RES, SUNSHADOW_COOKIE_RES, IMAGE_FORMAT_BGRA8888,
+				TEXTUREFLAGS_CLAMPS | TEXTUREFLAGS_CLAMPT | TEXTUREFLAGS_NOMIP |
+				TEXTUREFLAGS_NOLOD | TEXTUREFLAGS_SINGLECOPY | TEXTUREFLAGS_PROCEDURAL );
+			if ( m_CookieTexture[c].IsValid() )
+				m_CookieTexture[c]->SetTextureRegenerator( &m_CookieRegen[c] );
+		}
+		if ( !m_CookieTexture[c].IsValid() )
 			return;
 
-		m_CookieTexture.InitProceduralTexture( "sunshadow_cookie", TEXTURE_GROUP_CLIENT_EFFECTS,
-			SUNSHADOW_COOKIE_RES, SUNSHADOW_COOKIE_RES, IMAGE_FORMAT_BGRA8888,
-			TEXTUREFLAGS_CLAMPS | TEXTUREFLAGS_CLAMPT | TEXTUREFLAGS_NOMIP |
-			TEXTUREFLAGS_NOLOD | TEXTUREFLAGS_SINGLECOPY | TEXTUREFLAGS_PROCEDURAL );
-		if ( m_CookieTexture.IsValid() )
-		{
-			m_CookieTexture->SetTextureRegenerator( &s_SunShadowCookieRegen );
-			m_CookieTexture->Download();
-		}
+		// Inner handoff (to the finer cascade) sits at radius R[c-1] = R[c]/ratio;
+		// outer handoff at the cascade's own edge. Cascade 0 has no inner band.
+		float flInvRatio = ( flRatio > 1.0f ) ? 1.0f / flRatio : 0.0f;
+		float flInnerHi = ( c > 0 ) ? flInvRatio : 0.0f;
+		float flInnerLo = ( c > 0 ) ? flInvRatio * ( 1.0f - flBlend ) : 0.0f;
+		m_CookieRegen[c].SetBands( flInnerLo, flInnerHi, 1.0f - flBlend, 1.0f );
+		m_CookieTexture[c]->Download();
 	}
 
 	void UpdateSunShadow( const Vector &vecPlayerEyes )
 	{
-		float flRadius = MAX( r_sunshadow_distance.GetFloat(), 256.0f );
-		float flCasterHeight = MAX( r_sunshadow_casterheight.GetFloat(), flRadius );
+		const int nCascades = MAX_SUN_SHADOW_CASCADES;
+		float flOuterRadius = MAX( r_sunshadow_distance.GetFloat(), 256.0f );
+		float flRatio = clamp( r_sunshadow_cascade_ratio.GetFloat(), 1.5f, 16.0f );
+		float flBlend = clamp( r_sunshadow_cascade_blend.GetFloat(), 0.02f, 0.5f );
+		int nDepthRes = MAX( r_sunshadow_depthres.GetInt(), 1 );
 
-		InitCookieTexture();
-		if ( !m_CookieTexture.IsValid() )
-			return;
+		// Regenerate cookies only when the cascade shape actually changed.
+		if ( flRatio != m_flLastRatio || flBlend != m_flLastBlend )
+		{
+			for ( int c = 0; c < nCascades; ++c )
+				InitCookieTexture( c, flRatio, flBlend );
+			m_flLastRatio = flRatio;
+			m_flLastBlend = flBlend;
+		}
 
 		QAngle angSun;
 		VectorAngles( m_vecSunDirection, angSun );
 
-		// Snap the projection center to shadowmap-texel-sized world increments in
-		// the light's lateral plane, so shadow edges don't shimmer as the player
-		// moves ("texel snapping").
 		Vector vecFwd, vecRight, vecUp;
 		AngleVectors( angSun, &vecFwd, &vecRight, &vecUp );
 
-		Vector vecCenter = vecPlayerEyes;
-		int nDepthRes = MAX( r_sunshadow_depthres.GetInt(), 1 );
-		float flTexelSize = ( 2.0f * flRadius ) / nDepthRes;
-		float flRightCoord = DotProduct( vecCenter, vecRight );
-		float flUpCoord = DotProduct( vecCenter, vecUp );
-		vecCenter += vecRight * ( floorf( flRightCoord / flTexelSize ) * flTexelSize - flRightCoord );
-		vecCenter += vecUp * ( floorf( flUpCoord / flTexelSize ) * flTexelSize - flUpCoord );
-
-		FlashlightState_t state;
-		state.m_vecLightOrigin = vecCenter - m_vecSunDirection * flCasterHeight;
-		AngleQuaternion( angSun, state.m_quatOrientation );
-
-		state.m_fQuadraticAtten = 0.0f;
-		state.m_fLinearAtten = 0.0f;
-		state.m_fConstantAtten = 1.0f;
-
-		float flIntensity = r_sunshadow_intensity.GetFloat();
-		state.m_Color[0] = m_vecSunColor.x * flIntensity;
-		state.m_Color[1] = m_vecSunColor.y * flIntensity;
-		state.m_Color[2] = m_vecSunColor.z * flIntensity;
-		state.m_Color[3] = 0.0f;
-
-		state.m_NearZ = 16.0f;
-		state.m_FarZ = flCasterHeight + 2.0f * flRadius;
-
-		// FOV values are only used for the initial (perspective) matrix build
-		// inside CreateFlashlight before the ortho parameters are registered.
-		state.m_fHorizontalFOVDegrees = 90.0f;
-		state.m_fVerticalFOVDegrees = 90.0f;
-
-		state.m_pSpotlightTexture = m_CookieTexture;
-		state.m_nSpotlightTextureFrame = 0;
-
-		state.m_bEnableShadows = true;
-		state.m_flShadowMapResolution = nDepthRes;
-		state.m_flShadowFilterSize = r_sunshadow_filter.GetFloat();
-		state.m_flShadowSlopeScaleDepthBias = r_sunshadow_slopescale.GetFloat();
-		state.m_flShadowDepthBias = r_sunshadow_depthbias.GetFloat();
-		state.m_flShadowAtten = 0.0f;
-
-		if ( m_ShadowHandle == CLIENTSHADOW_INVALID_HANDLE )
+		for ( int c = 0; c < nCascades; ++c )
 		{
-			m_ShadowHandle = g_pClientShadowMgr->CreateFlashlight( state );
-			if ( m_ShadowHandle == CLIENTSHADOW_INVALID_HANDLE )
-				return;
-		}
+			// Cascade c radius: outermost = r_sunshadow_distance, each finer one
+			// is 'ratio' times smaller. (c = nCascades-1 is the outer cascade.)
+			float flRadius = flOuterRadius;
+			for ( int k = c; k < nCascades - 1; ++k )
+				flRadius /= flRatio;
 
-		// Ortho params first, then the state update rebuilds the world-to-shadow
-		// matrix orthographically.
-		g_pClientShadowMgr->SetFlashlightOrtho( m_ShadowHandle, true,
-			-flRadius, -flRadius, flRadius, flRadius );
-		g_pClientShadowMgr->UpdateFlashlightState( m_ShadowHandle, state );
-		g_pClientShadowMgr->UpdateProjectedTexture( m_ShadowHandle, true );
+			float flCasterHeight = MAX( r_sunshadow_casterheight.GetFloat(), flRadius );
+
+			// Cookies are (re)generated above only when the cascade shape changes.
+			if ( !m_CookieTexture[c].IsValid() )
+				continue;
+
+			// Snap the projection center to texel-sized increments in the light's
+			// lateral plane so shadow edges don't shimmer as the player moves.
+			Vector vecCenter = vecPlayerEyes;
+			float flTexelSize = ( 2.0f * flRadius ) / nDepthRes;
+			float flRightCoord = DotProduct( vecCenter, vecRight );
+			float flUpCoord = DotProduct( vecCenter, vecUp );
+			vecCenter += vecRight * ( floorf( flRightCoord / flTexelSize ) * flTexelSize - flRightCoord );
+			vecCenter += vecUp * ( floorf( flUpCoord / flTexelSize ) * flTexelSize - flUpCoord );
+
+			FlashlightState_t state;
+			state.m_vecLightOrigin = vecCenter - m_vecSunDirection * flCasterHeight;
+			AngleQuaternion( angSun, state.m_quatOrientation );
+
+			state.m_fQuadraticAtten = 0.0f;
+			state.m_fLinearAtten = 0.0f;
+			state.m_fConstantAtten = 1.0f;
+
+			// All cascades share the same sun colour x intensity; the ring cookies
+			// keep the total additive contribution at 1x across their overlaps.
+			float flIntensity = r_sunshadow_intensity.GetFloat();
+			state.m_Color[0] = m_vecSunColor.x * flIntensity;
+			state.m_Color[1] = m_vecSunColor.y * flIntensity;
+			state.m_Color[2] = m_vecSunColor.z * flIntensity;
+			state.m_Color[3] = 0.0f;
+
+			state.m_NearZ = 16.0f;
+			state.m_FarZ = flCasterHeight + 2.0f * flRadius;
+
+			// FOV only matters for the initial perspective matrix build inside
+			// CreateFlashlight before the ortho parameters are registered.
+			state.m_fHorizontalFOVDegrees = 90.0f;
+			state.m_fVerticalFOVDegrees = 90.0f;
+
+			state.m_pSpotlightTexture = m_CookieTexture[c];
+			state.m_nSpotlightTextureFrame = 0;
+
+			state.m_bEnableShadows = true;
+			state.m_flShadowMapResolution = nDepthRes;
+			state.m_flShadowFilterSize = r_sunshadow_filter.GetFloat();
+			state.m_flShadowSlopeScaleDepthBias = r_sunshadow_slopescale.GetFloat();
+			state.m_flShadowDepthBias = r_sunshadow_depthbias.GetFloat();
+			state.m_flShadowAtten = 0.0f;
+
+			if ( m_ShadowHandle[c] == CLIENTSHADOW_INVALID_HANDLE )
+			{
+				m_ShadowHandle[c] = g_pClientShadowMgr->CreateFlashlight( state );
+				if ( m_ShadowHandle[c] == CLIENTSHADOW_INVALID_HANDLE )
+					continue;
+			}
+
+			// Ortho params (with this cascade's dedicated depth texture) first,
+			// then the state update rebuilds the world-to-shadow matrix.
+			g_pClientShadowMgr->SetFlashlightOrtho( m_ShadowHandle[c], true,
+				-flRadius, -flRadius, flRadius, flRadius, c );
+			g_pClientShadowMgr->UpdateFlashlightState( m_ShadowHandle[c], state );
+			g_pClientShadowMgr->UpdateProjectedTexture( m_ShadowHandle[c], true );
+		}
 	}
 
 	void DestroySunShadow()
 	{
-		if ( m_ShadowHandle != CLIENTSHADOW_INVALID_HANDLE )
+		for ( int c = 0; c < MAX_SUN_SHADOW_CASCADES; ++c )
 		{
-			g_pClientShadowMgr->DestroyFlashlight( m_ShadowHandle );
-			m_ShadowHandle = CLIENTSHADOW_INVALID_HANDLE;
+			if ( m_ShadowHandle[c] != CLIENTSHADOW_INVALID_HANDLE )
+			{
+				g_pClientShadowMgr->DestroyFlashlight( m_ShadowHandle[c] );
+				m_ShadowHandle[c] = CLIENTSHADOW_INVALID_HANDLE;
+			}
 		}
 	}
 
@@ -558,8 +634,11 @@ private:
 
 	void CreateMaskTexture();
 
-	ClientShadowHandle_t	m_ShadowHandle;
-	CTextureReference		m_CookieTexture;
+	ClientShadowHandle_t	m_ShadowHandle[MAX_SUN_SHADOW_CASCADES];
+	CTextureReference		m_CookieTexture[MAX_SUN_SHADOW_CASCADES];
+	CSunShadowCookieRegenerator m_CookieRegen[MAX_SUN_SHADOW_CASCADES];
+	float					m_flLastRatio;		// cascade shape the cookies were built for
+	float					m_flLastBlend;
 	Vector					m_vecSunDirection;	// direction the sunlight travels (points down)
 	Vector					m_vecSunColor;		// normalized hue from the BSP skylight
 	int						m_nSunStyle;		// lightstyle VRAD baked the skylight with

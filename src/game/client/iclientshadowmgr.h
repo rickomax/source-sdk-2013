@@ -24,6 +24,14 @@
 //-----------------------------------------------------------------------------
 struct FlashlightState_t;
 
+// Number of orthographic sun shadow cascades. Each cascade is its own ortho
+// "flashlight" with its own depth texture and a ring cookie, drawn additively;
+// the cookies form a partition of unity so overlaps don't double-brighten.
+// Each cascade allocates a depth texture at r_sunshadow_depthres, so keep that
+// resolution moderate (1024-2048) -- the near cascade's small radius is what
+// buys sharpness, not a huge texture.
+#define MAX_SUN_SHADOW_CASCADES		3
+
 
 //-----------------------------------------------------------------------------
 // Handles to a client shadow
@@ -59,8 +67,11 @@ public:
 	// the engine never needs to know about the projection type.
 	// Call before UpdateFlashlightState; extents are view-space (left/top/right/
 	// bottom, matching MatrixBuildOrtho and CViewSetup ortho semantics).
+	// nSunCascade selects which dedicated sun depth texture this ortho flashlight
+	// renders into (0..MAX_SUN_SHADOW_CASCADES-1); pass -1 for a non-sun ortho
+	// flashlight that should use the regular pooled depth texture.
 	virtual void SetFlashlightOrtho( ClientShadowHandle_t shadowHandle, bool bOrtho,
-		float flLeft, float flTop, float flRight, float flBottom ) = 0;
+		float flLeft, float flTop, float flRight, float flBottom, int nSunCascade = -1 ) = 0;
 
 	// Sunlight pass for view models: Setup flips the render context into
 	// flashlight mode with the sun's state/matrix/depth texture bound and

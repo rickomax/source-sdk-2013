@@ -849,6 +849,7 @@ private:
 		float					m_flOrthoTop;
 		float					m_flOrthoRight;
 		float					m_flOrthoBottom;
+		int						m_nSunCascade;	// which dedicated sun depth texture (-1 = none)
 	};
 
 private:
@@ -988,7 +989,7 @@ private:
 	// holds a single depth texture on PC, which the player's flashlight needs;
 	// the sun also wants its own (usually higher) resolution, set by
 	// r_sunshadow_depthres.
-	CTextureReference m_SunShadowDepthTexture;
+	CTextureReference m_SunShadowDepthTexture[MAX_SUN_SHADOW_CASCADES];
 	CTextureReference m_SunShadowDummyColorTexture;
 
 	CUtlLinkedList< ClientShadow_t, ClientShadowHandle_t >	m_Shadows;
@@ -1438,21 +1439,32 @@ void CClientShadowMgr::InitDepthTextureShadows()
 			m_DepthTextureCacheLocks.AddToTail( bFalse );
 		}
 
-		// Dedicated depth texture for the orthographic sun shadow, at its own
-		// resolution. The PC pool above only has one entry, which the player's
-		// flashlight uses; without this, sun + flashlight couldn't shadow at once.
+		// Dedicated depth textures for the orthographic sun shadow cascades, at
+		// their own resolution. The PC pool above only has one entry, which the
+		// player's flashlight uses; each sun cascade gets its own so sun + player
+		// flashlight (and the cascades with each other) can all shadow at once.
+		// The dummy color RT is shared -- it is write-only scratch during the
+		// depth pass, so the cascades can reuse one.
 		int nSunRes = r_sunshadow_depthres.GetInt();
 		if ( nSunRes > 0 )
 		{
 #if defined( _X360 )
 			m_SunShadowDummyColorTexture.InitRenderTargetTexture( nSunRes, nSunRes, RT_SIZE_OFFSCREEN, IMAGE_FORMAT_BGR565, MATERIAL_RT_DEPTH_SHARED, false, "_rt_SunShadowDummy" );
 			m_SunShadowDummyColorTexture.InitRenderTargetSurface( nSunRes, nSunRes, IMAGE_FORMAT_BGR565, true );
-			m_SunShadowDepthTexture.InitRenderTargetTexture( nSunRes, nSunRes, RT_SIZE_OFFSCREEN, dstFormat, MATERIAL_RT_DEPTH_NONE, false, "_rt_SunShadowDepth" );
-			m_SunShadowDepthTexture.InitRenderTargetSurface( 1, 1, dstFormat, false );
 #else
 			m_SunShadowDummyColorTexture.InitRenderTarget( nSunRes, nSunRes, RT_SIZE_OFFSCREEN, nullFormat, MATERIAL_RT_DEPTH_NONE, false, "_rt_SunShadowDummy" );
-			m_SunShadowDepthTexture.InitRenderTarget( nSunRes, nSunRes, RT_SIZE_OFFSCREEN, dstFormat, MATERIAL_RT_DEPTH_NONE, false, "_rt_SunShadowDepth" );
 #endif
+			for ( int c = 0; c < MAX_SUN_SHADOW_CASCADES; ++c )
+			{
+				char szName[64];
+				Q_snprintf( szName, sizeof( szName ), "_rt_SunShadowDepth%d", c );
+#if defined( _X360 )
+				m_SunShadowDepthTexture[c].InitRenderTargetTexture( nSunRes, nSunRes, RT_SIZE_OFFSCREEN, dstFormat, MATERIAL_RT_DEPTH_NONE, false, szName );
+				m_SunShadowDepthTexture[c].InitRenderTargetSurface( 1, 1, dstFormat, false );
+#else
+				m_SunShadowDepthTexture[c].InitRenderTarget( nSunRes, nSunRes, RT_SIZE_OFFSCREEN, dstFormat, MATERIAL_RT_DEPTH_NONE, false, szName );
+#endif
+			}
 		}
 
 		materials->EndRenderTargetAllocation();
@@ -1466,7 +1478,8 @@ void CClientShadowMgr::ShutdownDepthTextureShadows()
 		// Shut down the dummy texture
 		m_DummyColorTexture.Shutdown();
 
-		m_SunShadowDepthTexture.Shutdown();
+		for ( int c = 0; c < MAX_SUN_SHADOW_CASCADES; ++c )
+			m_SunShadowDepthTexture[c].Shutdown();
 		m_SunShadowDummyColorTexture.Shutdown();
 
 		while( m_DepthTextureCache.Count() )
@@ -1891,7 +1904,8 @@ ClientShadowHandle_t CClientShadowMgr::CreateProjectedTexture( ClientEntityHandl
 	shadow.m_LastAngles.Init( FLT_MAX, FLT_MAX, FLT_MAX );
 	shadow.m_bOrtho = false;
 	shadow.m_flOrthoLeft = shadow.m_flOrthoTop = shadow.m_flOrthoRight = shadow.m_flOrthoBottom = 0.0f;
-	Assert( ( ( shadow.m_Flags & SHADOW_FLAGS_FLASHLIGHT ) == 0 ) != 
+	shadow.m_nSunCascade = -1;
+	Assert( ( ( shadow.m_Flags & SHADOW_FLAGS_FLASHLIGHT ) == 0 ) !=
 			( ( shadow.m_Flags & SHADOW_FLAGS_SHADOW ) == 0 ) );
 
 	// Set up the flags....
@@ -2040,7 +2054,7 @@ void CClientShadowMgr::DestroyFlashlight( ClientShadowHandle_t shadowHandle )
 // before UpdateFlashlightState so the next matrix build picks it up.
 //-----------------------------------------------------------------------------
 void CClientShadowMgr::SetFlashlightOrtho( ClientShadowHandle_t shadowHandle, bool bOrtho,
-	float flLeft, float flTop, float flRight, float flBottom )
+	float flLeft, float flTop, float flRight, float flBottom, int nSunCascade )
 {
 	if ( shadowHandle == CLIENTSHADOW_INVALID_HANDLE )
 		return;
@@ -2051,6 +2065,7 @@ void CClientShadowMgr::SetFlashlightOrtho( ClientShadowHandle_t shadowHandle, bo
 	shadow.m_flOrthoTop = flTop;
 	shadow.m_flOrthoRight = flRight;
 	shadow.m_flOrthoBottom = flBottom;
+	shadow.m_nSunCascade = nSunCascade;
 }
 
 //-----------------------------------------------------------------------------
@@ -2841,13 +2856,15 @@ void CClientShadowMgr::BuildFlashlight( ClientShadowHandle_t handle )
 //-----------------------------------------------------------------------------
 bool CClientShadowMgr::SetupSunlightViewModelPass()
 {
-	if ( !m_SunShadowDepthTexture.IsValid() )
+	// The view model sits right at the camera, so cascade 0 (the sharp, nearest
+	// cascade) is the one that covers it.
+	if ( !m_SunShadowDepthTexture[0].IsValid() )
 		return false;
 
 	for ( ClientShadowHandle_t i = m_Shadows.Head(); i != m_Shadows.InvalidIndex(); i = m_Shadows.Next(i) )
 	{
 		ClientShadow_t &shadow = m_Shadows[i];
-		if ( !shadow.m_bOrtho || ( shadow.m_Flags & SHADOW_FLAGS_FLASHLIGHT ) == 0 )
+		if ( !shadow.m_bOrtho || shadow.m_nSunCascade != 0 || ( shadow.m_Flags & SHADOW_FLAGS_FLASHLIGHT ) == 0 )
 			continue;
 
 		const FlashlightState_t &state = shadowmgr->GetFlashlightState( shadow.m_ShadowHandle );
@@ -2859,7 +2876,7 @@ bool CClientShadowMgr::SetupSunlightViewModelPass()
 		// material variant needs and flip the context into flashlight mode.
 		CMatRenderContextPtr pRenderContext( materials );
 		pRenderContext->SetFlashlightMode( true );
-		pRenderContext->SetFlashlightStateEx( state, shadow.m_WorldToShadow, m_SunShadowDepthTexture );
+		pRenderContext->SetFlashlightStateEx( state, shadow.m_WorldToShadow, m_SunShadowDepthTexture[0] );
 		return true;
 	}
 
@@ -2878,13 +2895,14 @@ void CClientShadowMgr::FinishSunlightViewModelPass()
 //-----------------------------------------------------------------------------
 bool CClientShadowMgr::GetSunShadowToTextureMatrix( VMatrix &worldToShadowTexture )
 {
-	if ( !m_SunShadowDepthTexture.IsValid() )
+	// Report cascade 0's matrix (the legacy single-cascade shader path).
+	if ( !m_SunShadowDepthTexture[0].IsValid() )
 		return false;
 
 	for ( ClientShadowHandle_t i = m_Shadows.Head(); i != m_Shadows.InvalidIndex(); i = m_Shadows.Next(i) )
 	{
 		ClientShadow_t &shadow = m_Shadows[i];
-		if ( !shadow.m_bOrtho || ( shadow.m_Flags & SHADOW_FLAGS_FLASHLIGHT ) == 0 )
+		if ( !shadow.m_bOrtho || shadow.m_nSunCascade != 0 || ( shadow.m_Flags & SHADOW_FLAGS_FLASHLIGHT ) == 0 )
 			continue;
 
 		const FlashlightState_t &state = shadowmgr->GetFlashlightState( shadow.m_ShadowHandle );
@@ -4183,16 +4201,19 @@ void CClientShadowMgr::ComputeShadowDepthTextures( const CViewSetup &viewSetup )
 	{
 		ClientShadow_t& shadow = m_Shadows[ pActiveDepthShadows[j] ];
 
-		// The orthographic sun shadow uses its own dedicated depth texture so it
-		// doesn't fight the player's flashlight over the single pooled texture,
-		// and so it can run at its own resolution (r_sunshadow_depthres).
-		bool bUseSunDepthTexture = shadow.m_bOrtho && m_SunShadowDepthTexture.IsValid();
+		// Each orthographic sun cascade uses its own dedicated depth texture so it
+		// doesn't fight the player's flashlight (or the other cascades) over the
+		// single pooled texture, and so it can run at its own resolution
+		// (r_sunshadow_depthres).
+		int nSunCascade = shadow.m_nSunCascade;
+		bool bUseSunDepthTexture = shadow.m_bOrtho && nSunCascade >= 0 &&
+			nSunCascade < MAX_SUN_SHADOW_CASCADES && m_SunShadowDepthTexture[nSunCascade].IsValid();
 
 		CTextureReference shadowDepthTexture;
 		bool bGotShadowDepthTexture;
 		if ( bUseSunDepthTexture )
 		{
-			shadowDepthTexture.Init( m_SunShadowDepthTexture );
+			shadowDepthTexture.Init( m_SunShadowDepthTexture[nSunCascade] );
 			bGotShadowDepthTexture = true;
 		}
 		else
