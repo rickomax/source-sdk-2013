@@ -732,7 +732,7 @@ public:
 	virtual void UpdateFlashlightState( ClientShadowHandle_t shadowHandle, const FlashlightState_t &lightState );
 	virtual void DestroyFlashlight( ClientShadowHandle_t shadowHandle );
 	virtual void SetFlashlightOrtho( ClientShadowHandle_t shadowHandle, bool bOrtho,
-		float flLeft, float flTop, float flRight, float flBottom );
+		float flLeft, float flTop, float flRight, float flBottom, int nSunCascade = -1 );
 
 	virtual bool SetupSunlightViewModelPass();
 	virtual void FinishSunlightViewModelPass();
