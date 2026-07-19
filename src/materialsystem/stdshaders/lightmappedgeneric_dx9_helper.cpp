@@ -13,6 +13,7 @@
 #include "lightmappedgeneric_ps20.inc"
 #include "lightmappedgeneric_vs20.inc"
 #include "lightmappedgeneric_ps20b.inc"
+#include "sunshadowmask.h"		// SunShadowRenderParm_t: client->shader contract
 
 #include "tier0/memdbgon.h"
 
@@ -547,6 +548,16 @@ void DrawLightmappedGeneric_DX9_Internal(CBaseVSShader *pShader, IMaterialVar** 
 					pShaderShadow->EnableTexture( SHADER_SAMPLER15, true );
 				}
 
+#ifndef _X360
+				// Mod override: runtime sun depth map for the darkening shader
+				// (ps_2_b+ only; matches SUNSHADOW_DARKENING in the .fxc).
+				if ( g_pHardwareConfig->SupportsPixelShaders_2_b() )
+				{
+					pShaderShadow->EnableTexture( SHADER_SAMPLER14, true );
+					pShaderShadow->SetShadowDepthFiltering( SHADER_SAMPLER14 );
+				}
+#endif
+
 				if( hasVertexColor || hasBaseTexture2 || hasBump2 )
 				{
 					flags |= VERTEX_COLOR;
@@ -1006,6 +1017,37 @@ void DrawLightmappedGeneric_DX9_Internal(CBaseVSShader *pShader, IMaterialVar** 
 			
 			SET_DYNAMIC_PIXEL_SHADER_CMD( DynamicCmdsOut, lightmappedgeneric_ps20 );
 		}
+
+#ifndef _X360
+		// Mod override: forward the client-published sun-shadow transforms to the
+		// pixel shader (c24..c29) and bind the runtime sun depth map. ps_2_b only,
+		// matching SUNSHADOW_DARKENING in the .fxc. Disabled frames publish
+		// enabled=0 in PARAMS0.x so the shader early-outs.
+		if ( g_pHardwareConfig->SupportsPixelShaders_2_b() )
+		{
+			// Pack each affine row's linear part in .xyz and its translation
+			// component in .w to fit the sun transform into 3 constants (c23..c25),
+			// then merge the scalars into c26. Matches the .fxc layout above.
+			Vector vRowU  = pShaderAPI->GetVectorRenderingParameter( SUNSHADOW_RP_SUN_ROW_U );
+			Vector vRowV  = pShaderAPI->GetVectorRenderingParameter( SUNSHADOW_RP_SUN_ROW_V );
+			Vector vRowD  = pShaderAPI->GetVectorRenderingParameter( SUNSHADOW_RP_SUN_ROW_D );
+			Vector vTrans = pShaderAPI->GetVectorRenderingParameter( SUNSHADOW_RP_SUN_TRANS );
+			Vector vP0    = pShaderAPI->GetVectorRenderingParameter( SUNSHADOW_RP_PARAMS0 );
+			Vector vP1    = pShaderAPI->GetVectorRenderingParameter( SUNSHADOW_RP_PARAMS1 );
+
+			float cU[4] = { vRowU.x, vRowU.y, vRowU.z, vTrans.x };
+			float cV[4] = { vRowV.x, vRowV.y, vRowV.z, vTrans.y };
+			float cD[4] = { vRowD.x, vRowD.y, vRowD.z, vTrans.z };
+			float cP[4] = { vP0.x,   vP0.y,   vP0.z,   vP1.x };		// enabled, maskBias, sunBias, darkFloor
+
+			DynamicCmdsOut.SetPixelShaderConstant( 23, cU, 1 );
+			DynamicCmdsOut.SetPixelShaderConstant( 24, cV, 1 );
+			DynamicCmdsOut.SetPixelShaderConstant( 25, cD, 1 );
+			DynamicCmdsOut.SetPixelShaderConstant( 26, cP, 1 );
+
+			pShader->BindTexture( SHADER_SAMPLER14, info.m_nSunShadowDepthTexture, -1 );
+		}
+#endif
 
 		if( hasFlashlight && IsX360() )
 		{

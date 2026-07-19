@@ -54,6 +54,12 @@ $Project
 		$File	"example_model_dx9.cpp"
 		$File	"example_model_dx9_helper.cpp"
 
+		// Mod override of the stock world shader, adding baked-mask + runtime
+		// sun-shadow darkening. Registers the "LightmappedGeneric" name from this
+		// game_shader DLL so it takes over from the built-in one.
+		$File	"lightmappedgeneric_dx9.cpp"
+		$File	"lightmappedgeneric_dx9_helper.cpp"
+
 		$File	"Bloom.cpp"
 		$File	"screenspace_general.cpp"
 	}
@@ -69,6 +75,8 @@ $Project
 		$File	"shader_constant_register_map.h"
 
 		$File	"example_model_dx9_helper.h"
+		$File	"lightmappedgeneric_dx9_helper.h"
+		$File	"$SRCDIR\public\sunshadowmask.h"
 	}
 
 	$Folder	"Link Libraries" [$WIN32]

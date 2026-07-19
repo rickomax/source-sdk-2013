@@ -101,6 +101,59 @@ const float3 g_FlashlightPos				: register( c14 );
 const float4x4 g_FlashlightWorldToTexture	: register( c15 ); // through c18
 const float4 g_ShadowTweaks					: register( c19 );
 
+//-----------------------------------------------------------------------------
+// Sun-shadow darkening (mod override): only on ps_2_b and up, where we have the
+// instruction slots and dynamic branching. The client publishes affine
+// world->space transforms + scalars via render parameters, which the helper
+// forwards here. c20..c23 are the baked mask transform (added in a later stage);
+// c24..c27 the runtime sun depth-map transform; c28/c29 the scalars.
+//-----------------------------------------------------------------------------
+#if !( defined( SHADER_MODEL_PS_1_1 ) || defined( SHADER_MODEL_PS_1_4 ) || defined( SHADER_MODEL_PS_2_0 ) )
+#define SUNSHADOW_DARKENING 1
+#else
+#define SUNSHADOW_DARKENING 0
+#endif
+
+// Registers c20..c26 (c27 spare); c28..c31 are taken by common_ps_fxc.h. Each
+// transform row packs its linear part in .xyz and its translation in .w, so a
+// 3-output affine transform needs only 3 registers. c20..c22 are the baked mask
+// transform (added in a later stage); c23..c25 the runtime sun depth-map one.
+#if SUNSHADOW_DARKENING
+sampler SunShadowDepthSampler				: register( s14 );	// _rt_SunShadowDepth
+const float4 g_SunShadowRowU				: register( c23 );	// xyz=linear, w=transU
+const float4 g_SunShadowRowV				: register( c24 );	// xyz=linear, w=transV
+const float4 g_SunShadowRowD				: register( c25 );	// xyz=linear, w=transD
+const float4 g_SunParams					: register( c26 );	// x=enabled y=maskBias z=sunBias w=darkFloor
+
+float ComputeSunDarkening( float3 worldPos )
+{
+	if ( g_SunParams.x < 0.5 )
+		return 1.0;								// feature disabled this frame
+
+	// Project into the runtime sun depth map (orthographic, so affine).
+	float3 sc;
+	sc.x = dot( worldPos, g_SunShadowRowU.xyz ) + g_SunShadowRowU.w;
+	sc.y = dot( worldPos, g_SunShadowRowV.xyz ) + g_SunShadowRowV.w;
+	sc.z = dot( worldPos, g_SunShadowRowD.xyz ) + g_SunShadowRowD.w;
+
+	if ( sc.x < 0.0 || sc.x > 1.0 || sc.y < 0.0 || sc.y > 1.0 || sc.z > 1.0 )
+		return 1.0;								// outside the sun frustum -> baked only
+
+	// Hardware PCF depth compare: 1 = lit, 0 = in dynamic sun shadow.
+	float dynamicSunVis = tex2Dproj( SunShadowDepthSampler,
+		float4( sc.xy, sc.z - g_SunParams.z, 1.0 ) ).r;
+
+	// Darken toward the floor where dynamically shadowed.
+	float darken = lerp( g_SunParams.w, 1.0, dynamicSunVis );
+
+	// Smoothly fade the darkening out over the outer 25% of the frustum so the
+	// transition back to the pure baked lightmap has no hard edge.
+	float2 cc = abs( sc.xy - 0.5 ) * 2.0;		// 0 at center, 1 at the edge
+	float fade = saturate( ( 1.0 - max( cc.x, cc.y ) ) / 0.25 );
+	return lerp( 1.0, darken, fade );
+}
+#endif
+
 
 sampler BaseTextureSampler		: register( s0 );
 sampler LightmapSampler			: register( s1 );
@@ -466,6 +519,12 @@ HALF4 main( PS_INPUT i ) : COLOR
 	{
 		diffuseLighting = lightmapColor1 * g_TintValuesAndLightmapScale.rgb;
 	}
+
+#if SUNSHADOW_DARKENING
+	// Remove doubled sun light: multiply the baked lightmap diffuse by the
+	// runtime sun shadow so moving/near geometry casts real sun shadows here.
+	diffuseLighting *= ComputeSunDarkening( i.worldPos_projPosZ.xyz );
+#endif
 
 #if WARPLIGHTING && ( SEAMLESS == 0 )
 	float len=0.5*length(diffuseLighting);

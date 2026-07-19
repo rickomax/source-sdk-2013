@@ -10,6 +10,11 @@
 example_model_ps20b.fxc
 example_model_vs20.fxc
 
+// Mod override of the world shader (baked-mask + runtime sun-shadow darkening).
+// _ps2x compiles to both ps20 and ps20b; the helper includes both .inc files.
+lightmappedgeneric_vs20.fxc
+lightmappedgeneric_ps2x.fxc
+
 SDK_Bloom_ps2x.fxc
 SDK_screenspaceeffect_vs20.fxc
 
