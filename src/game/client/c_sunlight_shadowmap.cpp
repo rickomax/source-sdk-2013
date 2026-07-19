@@ -505,6 +505,22 @@ private:
 		bool bDebug = r_sunshadow_cascade_debug.GetBool();
 		float flIntensity = r_sunshadow_intensity.GetFloat();
 
+		// ALL cascades share one projection center. If each snapped to its own
+		// texel grid the centers would differ by up to half a texel, offsetting the
+		// square ring cookies so their additive sum dips below 1 in a thin square
+		// band -- the dark edge where cascades meet. Snapping the common center to
+		// the FINEST cascade's texel keeps the sharp near cascade from shimmering;
+		// the coarser cascades ride the same center (sub-texel drift, invisible at
+		// their distance).
+		float flFinestTexel = ( 2.0f * flRadii[0] ) / MAX( CascadeRes( 0 ), 1 );
+		Vector vecCenter = vecPlayerEyes;
+		{
+			float flRightCoord = DotProduct( vecCenter, vecRight );
+			float flUpCoord = DotProduct( vecCenter, vecUp );
+			vecCenter += vecRight * ( floorf( flRightCoord / flFinestTexel ) * flFinestTexel - flRightCoord );
+			vecCenter += vecUp * ( floorf( flUpCoord / flFinestTexel ) * flFinestTexel - flUpCoord );
+		}
+
 		for ( int c = 0; c < nCascades; ++c )
 		{
 			float flRadius = flRadii[c];
@@ -514,15 +530,6 @@ private:
 			// Cookies are (re)generated above only when the cascade shape changes.
 			if ( !m_CookieTexture[c].IsValid() )
 				continue;
-
-			// Snap the projection center to texel-sized increments in the light's
-			// lateral plane so shadow edges don't shimmer as the player moves.
-			Vector vecCenter = vecPlayerEyes;
-			float flTexelSize = ( 2.0f * flRadius ) / nDepthRes;
-			float flRightCoord = DotProduct( vecCenter, vecRight );
-			float flUpCoord = DotProduct( vecCenter, vecUp );
-			vecCenter += vecRight * ( floorf( flRightCoord / flTexelSize ) * flTexelSize - flRightCoord );
-			vecCenter += vecUp * ( floorf( flUpCoord / flTexelSize ) * flTexelSize - flUpCoord );
 
 			FlashlightState_t state;
 			state.m_vecLightOrigin = vecCenter - m_vecSunDirection * flCasterHeight;
