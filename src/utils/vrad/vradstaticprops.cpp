@@ -1026,6 +1026,12 @@ void ComputeDirectLightingAtPoint( Vector &position, Vector &normal, Vector &out
 			continue;
 		}
 
+		// -nosundirect: keep static props consistent with the world -- leave the
+		// directional sun out of their baked lighting so the runtime sun shadow
+		// supplies it additively instead of doubling up.
+		if ( g_bNoSunDirect && dl->light.type == emit_skylight )
+			continue;
+
 		// is this lights cluster visible?
 		if ( !PVSCheck( dl->pvs, cluster ) )
 			continue;

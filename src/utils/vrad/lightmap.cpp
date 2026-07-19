@@ -2494,7 +2494,12 @@ static void GatherSampleLightAt4Points( SSE_SampleInfo_t& info, int sampleIdx, i
 
 	// Iterate over all direct lights and add them to the particular sample
 	for (directlight_t *dl = activelights; dl != NULL; dl = dl->next)
-	{	    
+	{
+		// -nosundirect: skip the directional sun (see the note in
+		// ResampleLightAt4Points). The sky ambient and other lights are kept.
+		if ( g_bNoSunDirect && dl->light.type == emit_skylight )
+			continue;
+
 		// is this lights cluster visible?
 		fltx4 dotMask = Four_Zeros;
 		bool skipLight = true;
@@ -2591,7 +2596,14 @@ static void ResampleLightAt4Points( SSE_SampleInfo_t& info, int lightStyleIndex,
 		if ((flags & NON_AMBIENT_ONLY) && (dl->light.type == emit_skyambient))
 			continue;
 
-		// Only add contributions that match the lightstyle 
+		// -nosundirect: leave the directional sun (emit_skylight) out of the baked
+		// lightmap so a runtime dynamic sun shadow can supply it additively. Its
+		// bounce is dropped too (patches are seeded from this same luxel light);
+		// the sky ambient (emit_skyambient) and all other lights are kept.
+		if ( g_bNoSunDirect && dl->light.type == emit_skylight )
+			continue;
+
+		// Only add contributions that match the lightstyle
 		Assert( lightStyleIndex <= MAXLIGHTMAPS );
 		Assert( info.m_pFace->styles[lightStyleIndex] != 255 );
 		if (dl->light.style != info.m_pFace->styles[lightStyleIndex])

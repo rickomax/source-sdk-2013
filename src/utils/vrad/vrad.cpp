@@ -2409,6 +2409,13 @@ int ParseCommandLine( int argc, char **argv, bool *onlydetail )
 		{
 			g_bDumpLightmaps = true;
 		}
+		else if ( !Q_stricmp( argv[i], "-nosundirect" ) )
+		{
+			// Leave the directional sun out of the baked lightmap so a runtime
+			// dynamic sun shadow supplies sun + shadows. Also drops the sun's
+			// bounce; sky ambient + other lights stay. See vrad.h.
+			g_bNoSunDirect = true;
+		}
 		else if ( !strcmp(argv[i], "-dump") )
 		{
 			g_bDumpPatches = true;

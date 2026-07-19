@@ -351,6 +351,14 @@ extern bool		g_bBuildSunShadowMask;
 extern bool		g_bDumpSunShadowMask;
 extern bool		g_bDumpLightmaps;
 extern int		g_nSunShadowMaskRes;
+
+// When set (-nosundirect), the directional skylight (emit_skylight) is left out
+// of the baked lightmap so a runtime dynamic sun shadow can supply the sun and
+// its shadows additively without doubling up. NOTE: because the radiosity patches
+// are seeded from the per-luxel direct lighting, this drops the sun's indirect
+// bounce as well; the sky ambient (emit_skyambient) and all other lights + their
+// bounce are kept. (A future refinement could retain the sun's bounce.)
+extern bool		g_bNoSunDirect;
 void BuildSunShadowMask();
 void DumpLightmapsToTGA();
 

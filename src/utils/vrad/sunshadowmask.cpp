@@ -27,6 +27,7 @@ bool g_bBuildSunShadowMask = false;
 bool g_bDumpSunShadowMask = false;
 bool g_bDumpLightmaps = false;
 int  g_nSunShadowMaskRes = 1024;
+bool g_bNoSunDirect = false;
 
 //-----------------------------------------------------------------------------
 // Minimal uncompressed 24-bit BGR TGA writer (top-left origin) for eyeballing
