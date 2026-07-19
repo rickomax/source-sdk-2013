@@ -609,17 +609,26 @@ void VectorToColorRGBExp32( const Vector& vin, ColorRGBExp32 &c )
 		scalar = *reinterpret_cast<float *>(&fbits);
 	}
 
-	// we should never need to clamp:
-	Assert(vin.x * scalar <= 255.0f && 
-		   vin.y * scalar <= 255.0f && 
-		   vin.z * scalar <= 255.0f);
+	// In theory the exponent above maps the brightest channel to <= 255, so we
+	// "should never need to clamp". In practice, computing the scalar from the
+	// exponent via bit twiddling can leave the brightest channel a single ULP
+	// over 255.0 (e.g. 255.00002) on bright luxels, which tripped this assert on
+	// otherwise fine maps. Allow that sub-unit overshoot and clamp to be safe --
+	// an unclamped value >= 256 would wrap to a garbage byte.
+	Assert(vin.x * scalar <= 256.0f &&
+		   vin.y * scalar <= 256.0f &&
+		   vin.z * scalar <= 256.0f);
 
-	// This awful construction is necessary to prevent VC2005 from using the 
+	// This awful construction is necessary to prevent VC2005 from using the
 	// fldcw/fnstcw control words around every float-to-unsigned-char operation.
 	{
 		int red = (vin.x * scalar);
 		int green = (vin.y * scalar);
 		int blue = (vin.z * scalar);
+
+		if ( red > 255 ) red = 255;
+		if ( green > 255 ) green = 255;
+		if ( blue > 255 ) blue = 255;
 
 		c.r = red;
 		c.g = green;
