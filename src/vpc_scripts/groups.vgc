@@ -64,3 +64,21 @@ $Group "dedicated"
 	"tier1"
 }
 
+// The map-compile tools only: vbsp / vvis / vrad and their launchers. Excludes
+// the optional tools in "everything" that need external SDKs not required for
+// map compiling or the game -- phonemeextractor (SAPI 5.1 Speech SDK) and
+// qc_eyes (MFC). VPC pulls in the library dependencies (mathlib/tier1/raytrace)
+// automatically, but they are listed for clarity.
+$Group "maptools"
+{
+	"vbsp"
+	"vvis_dll"
+	"vvis_launcher"
+	"vrad_dll"
+	"vrad_launcher"
+	"mathlib"
+	"tier1"
+	"raytrace"
+	"fgdlib"
+}
+
