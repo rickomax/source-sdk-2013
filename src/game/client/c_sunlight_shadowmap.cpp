@@ -54,6 +54,8 @@ static ConVar r_sunshadow_filter( "r_sunshadow_filter", "1.0", FCVAR_ARCHIVE,
 	"Sun shadowmap filter kernel size." );
 static ConVar r_sunshadow_depthbias( "r_sunshadow_depthbias", "0.0005", 0 );
 static ConVar r_sunshadow_slopescale( "r_sunshadow_slopescale", "4", 0 );
+static ConVar r_sunshadow_maskbias( "r_sunshadow_maskbias", "6.0", 0,
+	"Baked shadowmask depth-compare bias, in world units. A point is treated as sun-shadowed when it sits this far behind the nearest baked sun-facing surface." );
 
 //-----------------------------------------------------------------------------
 // Procedural cookie: white core with a smooth falloff to black over the outer
@@ -150,15 +152,33 @@ public:
 
 	bool HasBakedMask() const { return m_bHasMask; }
 
-	//-----------------------------------------------------------------------------
-	// CPU sample of the baked mask at a world position. Returns baked sun
-	// visibility 0..1 (0 = in baked shadow / behind the sun-facing surface).
-	// This is the reference the shader will reproduce; also used by the probe cmd.
-	//-----------------------------------------------------------------------------
-	float GetBakedSunVisibility( const Vector &vecWorldPos ) const
+	// Intermediate values of a mask sample, for the r_sunshadow_probe diagnostic.
+	struct MaskSample_t
 	{
+		bool	bInRange;		// query projected inside the baked U/V rectangle
+		bool	bHasSurface;	// a baked surface exists in this column (not open sky)
+		bool	bShadowed;		// depth-compare says the point is behind the occluder
+		int		x, y;			// texel sampled
+		float	texU, texV;		// [0,1] projection coords
+		float	depthNorm;		// query depth, normalized to the baked range
+		float	storedDepth;	// nearest baked surface depth at this texel
+		float	biasNorm;		// depth bias applied, in the same normalized units
+		float	vis;			// R channel (soft sun visibility of the sun-facing surface)
+		float	result;		// final visibility returned (0 = baked shadow, 1 = full sun)
+	};
+
+	//-----------------------------------------------------------------------------
+	// CPU sample of the baked mask at a world position, returning every
+	// intermediate value. GetBakedSunVisibility() wraps this; r_sunshadow_probe
+	// prints it so we can see exactly why a point reads lit or shadowed.
+	//-----------------------------------------------------------------------------
+	void SampleBakedMask( const Vector &vecWorldPos, MaskSample_t &out ) const
+	{
+		memset( &out, 0, sizeof( out ) );
+		out.result = 1.0f;
+		out.vis = 1.0f;
 		if ( !m_bHasMask )
-			return 1.0f;
+			return;
 
 		const SunShadowMaskHeader_t &h = m_MaskHeader;
 		Vector vSunDir( h.vecSunDir[0], h.vecSunDir[1], h.vecSunDir[2] );
@@ -171,30 +191,50 @@ public:
 		float v = DotProduct( vRel, vV );
 		float d = DotProduct( vRel, vSunDir );
 
-		float texU = ( u - h.flMinU ) / ( h.flMaxU - h.flMinU );
-		float texV = ( v - h.flMinV ) / ( h.flMaxV - h.flMinV );
-		if ( texU < 0.0f || texU > 1.0f || texV < 0.0f || texV > 1.0f )
-			return 1.0f;	// outside the baked region -- assume lit
+		out.texU = ( u - h.flMinU ) / ( h.flMaxU - h.flMinU );
+		out.texV = ( v - h.flMinV ) / ( h.flMaxV - h.flMinV );
+		if ( out.texU < 0.0f || out.texU > 1.0f || out.texV < 0.0f || out.texV > 1.0f )
+			return;	// outside the baked region -- assume lit
+		out.bInRange = true;
 
-		float depthNorm = ( d - h.flMinDepth ) / ( h.flMaxDepth - h.flMinDepth );
+		float flDepthSpan = h.flMaxDepth - h.flMinDepth;
+		out.depthNorm = ( flDepthSpan > 0.0f ) ? ( d - h.flMinDepth ) / flDepthSpan : 0.0f;
 
-		int x = (int)( texU * ( h.nResolution - 1 ) + 0.5f );
-		int y = (int)( texV * ( h.nResolution - 1 ) + 0.5f );
-		const unsigned char *pTexel = &m_MaskData[ ( y * h.nResolution + x ) * 4 ];
+		out.x = (int)( out.texU * ( h.nResolution - 1 ) + 0.5f );
+		out.y = (int)( out.texV * ( h.nResolution - 1 ) + 0.5f );
+		const unsigned char *pTexel = &m_MaskData[ ( out.y * h.nResolution + out.x ) * 4 ];
 
-		float flVis = pTexel[0] / 255.0f;						// R = soft sun visibility
+		out.vis = pTexel[0] / 255.0f;							// R = soft sun visibility
 		unsigned int usDepth = ( pTexel[1] << 8 ) | pTexel[2];	// G,B = 16-bit nearest depth
 		if ( usDepth == 0xFFFF )
-			return 1.0f;										// no surface recorded here
-		float flStoredDepth = usDepth / 65535.0f;
+			return;												// no surface recorded here -> lit
+		out.bHasSurface = true;
+		out.storedDepth = usDepth / 65535.0f;
 
-		// If we're farther from the sun than the nearest recorded surface, we're
-		// behind it -> in static shadow. Otherwise this is the sun-facing surface.
-		const float flDepthBias = 2.0f / 65535.0f;
-		if ( depthNorm > flStoredDepth + flDepthBias )
-			return 0.0f;
+		// Bias is authored in world units; convert to the normalized depth space.
+		out.biasNorm = ( flDepthSpan > 0.0f ) ? r_sunshadow_maskbias.GetFloat() / flDepthSpan : 0.0f;
 
-		return flVis;
+		// Farther from the sun than the nearest recorded surface (beyond the bias)
+		// means something is between us and the sun -> baked shadow.
+		if ( out.depthNorm > out.storedDepth + out.biasNorm )
+		{
+			out.bShadowed = true;
+			out.result = 0.0f;
+			return;
+		}
+
+		out.result = out.vis;	// this is (near) the sun-facing surface itself
+	}
+
+	//-----------------------------------------------------------------------------
+	// Baked sun visibility 0..1 (0 = in baked shadow) at a world position. This is
+	// the reference the shader will reproduce; also used by the probe command.
+	//-----------------------------------------------------------------------------
+	float GetBakedSunVisibility( const Vector &vecWorldPos ) const
+	{
+		MaskSample_t s;
+		SampleBakedMask( vecWorldPos, s );
+		return s.result;
 	}
 
 	virtual void Update( float frametime )
@@ -577,8 +617,24 @@ CON_COMMAND( r_sunshadow_probe, "Prints the baked sun visibility at the player's
 		return;
 
 	Vector vFeet = pPlayer->GetAbsOrigin();
-	Vector vEyes = pPlayer->EyePosition();
-	Msg( "Sun baked visibility: feet %.2f, eyes %.2f  (1 = full sun, 0 = baked shadow)\n",
-		s_SunlightShadowManager.GetBakedSunVisibility( vFeet ),
-		s_SunlightShadowManager.GetBakedSunVisibility( vEyes ) );
+	CSunlightShadowManager::MaskSample_t s;
+	s_SunlightShadowManager.SampleBakedMask( vFeet, s );
+
+	Msg( "Sun baked visibility at feet (%.0f %.0f %.0f): %.2f  (1 = full sun, 0 = baked shadow)\n",
+		vFeet.x, vFeet.y, vFeet.z, s.result );
+	if ( !s.bInRange )
+	{
+		Msg( "  projection: texU %.3f texV %.3f  -> OUTSIDE the baked rectangle (treated as lit).\n", s.texU, s.texV );
+		return;
+	}
+	Msg( "  texel:    (%d,%d)  texU %.3f texV %.3f\n", s.x, s.y, s.texU, s.texV );
+	if ( !s.bHasSurface )
+	{
+		Msg( "  no baked surface in this column (open sky) -> lit.\n" );
+		return;
+	}
+	Msg( "  depth:    query %.4f  vs stored %.4f  (+bias %.4f)\n", s.depthNorm, s.storedDepth, s.biasNorm );
+	Msg( "  compare:  query %s stored+bias  -> %s\n",
+		s.bShadowed ? ">" : "<=", s.bShadowed ? "SHADOWED" : "lit (this is the sun-facing surface)" );
+	Msg( "  R vis:    %.3f (soft sun visibility of the sun-facing surface)\n", s.vis );
 }

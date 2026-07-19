@@ -221,6 +221,81 @@ void BuildSunShadowMask()
 		nRes, nRes, vSunDir.x, vSunDir.y, vSunDir.z );
 	float flStart = Plat_FloatTime();
 
+	// --- Pass 1: trace every column, recording the raw depth-along-sun of the
+	// first solid hit and its soft sun visibility. Crucially, we measure the
+	// depth range from the SURFACES actually hit -- not from the world AABB. The
+	// AABB spans the whole (mostly empty) skybox, so normalizing against it would
+	// crush every real surface into a sliver of the 16-bit depth range, and the
+	// runtime depth-compare could no longer tell an occluder apart from the
+	// receiver it shadows (every texel reads back nearly the same depth). A tight
+	// range keeps the shadow test meaningful.
+	const size_t nTexels = (size_t)nRes * nRes;
+	float *pDepthF = (float *)malloc( nTexels * sizeof( float ) );
+	float *pVisF   = (float *)malloc( nTexels * sizeof( float ) );
+	if ( !pDepthF || !pVisF )
+	{
+		Msg( "-sunshadowmask: out of memory for a %dx%d bake.\n", nRes, nRes );
+		free( pDepthF ); free( pVisF );
+		return;
+	}
+
+	float flHitMinD = FLT_MAX, flHitMaxD = -FLT_MAX;
+	int nHits = 0;
+	for ( int y = 0; y < nRes; ++y )
+	{
+		for ( int x = 0; x < nRes; ++x )
+		{
+			float u = flMinU + ( ( x + 0.5f ) / nRes ) * ( flMaxU - flMinU );
+			float v = flMinV + ( ( y + 0.5f ) / nRes ) * ( flMaxV - flMinV );
+
+			// Start just before the near depth and trace along the sun direction.
+			Vector vColStart = vOrigin + vAxisU * u + vAxisV * v + vSunDir * ( flMinD - flMargin );
+
+			size_t idx = (size_t)y * nRes + x;
+			float flHitDist = TraceColumnFirstHit( vColStart, vSunDir, flColumnLen );
+			if ( flHitDist >= 0.0f )
+			{
+				Vector vHit = vColStart + vSunDir * flHitDist;
+				float d = DotProduct( vHit - vOrigin, vSunDir );
+				float flVis = clamp( ComputeSunVisibility( vHit, vSunDir, vAxisU, vAxisV ), 0.0f, 1.0f );
+				pDepthF[idx] = d;
+				pVisF[idx]   = flVis;
+				flHitMinD = min( flHitMinD, d );
+				flHitMaxD = max( flHitMaxD, d );
+				++nHits;
+			}
+			else
+			{
+				pDepthF[idx] = FLT_MAX;		// no surface in this column
+				pVisF[idx]   = 0.0f;
+			}
+		}
+
+		if ( ( y & 63 ) == 0 )
+		{
+			Msg( "\r-sunshadowmask: tracing %d%%   ", ( y * 100 ) / nRes );
+			fflush( stdout );
+		}
+	}
+
+	// Fall back to the AABB range only if the whole map was open sky.
+	if ( nHits == 0 )
+	{
+		flHitMinD = flMinD;
+		flHitMaxD = flMaxD;
+	}
+	else
+	{
+		flHitMinD -= 1.0f;		// a hair of padding so the extremes quantize inside [0,1]
+		flHitMaxD += 1.0f;
+	}
+	const float flTightRange = flHitMaxD - flHitMinD;
+	const float flInvDepthRange = ( flTightRange > 0.0f ) ? 1.0f / flTightRange : 0.0f;
+
+	Msg( "\r-sunshadowmask: %d/%u columns hit a surface; depth range %.1f..%.1f (%.1f units)\n",
+		nHits, (unsigned)nTexels, flHitMinD, flHitMaxD, flTightRange );
+
+	// Header, now that the tight depth range is known.
 	CUtlBuffer buf;
 	SunShadowMaskHeader_t hdr;
 	hdr.nMagic = SUNSHADOWMASK_MAGIC;
@@ -232,72 +307,52 @@ void BuildSunShadowMask()
 	vAxisV.CopyToArray( hdr.vecAxisV );
 	hdr.flMinU = flMinU; hdr.flMaxU = flMaxU;
 	hdr.flMinV = flMinV; hdr.flMaxV = flMaxV;
-	hdr.flMinDepth = flMinD; hdr.flMaxDepth = flMaxD;
+	hdr.flMinDepth = flHitMinD; hdr.flMaxDepth = flHitMaxD;
 	buf.Put( &hdr, sizeof( hdr ) );
 
-	const float flInvDepthRange = ( flDepthRange > 0.0f ) ? 1.0f / flDepthRange : 0.0f;
-
-	// Optional debug image (BGR). Visibility as grayscale; columns that hit no
-	// surface (open sky) are tinted blue so coverage/gaps are obvious.
+	// Optional debug image (BGR): the DEPTH channel as grayscale (near-to-sun =
+	// dark, far = bright) so surface relief is visible; open-sky columns tint
+	// blue. Depth is the channel the runtime shadow test relies on, so this is
+	// what to eyeball -- the visibility (R) channel is ~1 on every sun-facing
+	// surface by construction and would just look uniformly white.
 	unsigned char *pDebugBGR = NULL;
 	if ( g_bDumpSunShadowMask )
-	{
-		pDebugBGR = (unsigned char *)malloc( (size_t)nRes * nRes * 3 );
-	}
+		pDebugBGR = (unsigned char *)malloc( nTexels * 3 );
 
-	for ( int y = 0; y < nRes; ++y )
+	// --- Pass 2: quantize into the sidecar (R=vis, G/B=16-bit tight depth).
+	for ( size_t idx = 0; idx < nTexels; ++idx )
 	{
-		for ( int x = 0; x < nRes; ++x )
+		unsigned char rgba[4] = { 0, 0xFF, 0xFF, 0xFF };	// no-hit sentinel: depth 0xFFFF
+		float flDepthNorm = 1.0f;
+		bool bHit = ( pDepthF[idx] != FLT_MAX );
+		if ( bHit )
 		{
-			float u = flMinU + ( ( x + 0.5f ) / nRes ) * ( flMaxU - flMinU );
-			float v = flMinV + ( ( y + 0.5f ) / nRes ) * ( flMaxV - flMinV );
+			flDepthNorm = clamp( ( pDepthF[idx] - flHitMinD ) * flInvDepthRange, 0.0f, 1.0f );
+			unsigned short usDepth = (unsigned short)( flDepthNorm * 65535.0f + 0.5f );
+			rgba[0] = (unsigned char)( pVisF[idx] * 255.0f + 0.5f );
+			rgba[1] = (unsigned char)( usDepth >> 8 );
+			rgba[2] = (unsigned char)( usDepth & 0xFF );
+			rgba[3] = 0xFF;
+		}
+		buf.Put( rgba, 4 );
 
-			// Start just before the near depth and trace along the sun direction.
-			Vector vColStart = vOrigin + vAxisU * u + vAxisV * v + vSunDir * ( flMinD - flMargin );
-
-			unsigned char rgba[4] = { 0, 0xFF, 0xFF, 0xFF };	// vis 0, depth = no-hit
-			bool bHit = false;
-
-			float flHitDist = TraceColumnFirstHit( vColStart, vSunDir, flColumnLen );
-			if ( flHitDist >= 0.0f )
+		if ( pDebugBGR )
+		{
+			unsigned char *pPixel = pDebugBGR + idx * 3;
+			if ( bHit )
 			{
-				bHit = true;
-				Vector vHit = vColStart + vSunDir * flHitDist;
-				float d = DotProduct( vHit - vOrigin, vSunDir );
-				float flDepthNorm = clamp( ( d - flMinD ) * flInvDepthRange, 0.0f, 1.0f );
-				unsigned short usDepth = (unsigned short)( flDepthNorm * 65535.0f + 0.5f );
-
-				float flVis = ComputeSunVisibility( vHit, vSunDir, vAxisU, vAxisV );
-				flVis = clamp( flVis, 0.0f, 1.0f );
-
-				rgba[0] = (unsigned char)( flVis * 255.0f + 0.5f );
-				rgba[1] = (unsigned char)( usDepth >> 8 );
-				rgba[2] = (unsigned char)( usDepth & 0xFF );
-				rgba[3] = 0xFF;
+				unsigned char g = (unsigned char)( flDepthNorm * 255.0f + 0.5f );
+				pPixel[0] = pPixel[1] = pPixel[2] = g;		// grayscale depth
 			}
-
-			buf.Put( rgba, 4 );
-
-			if ( pDebugBGR )
+			else
 			{
-				unsigned char *pPixel = pDebugBGR + ( (size_t)y * nRes + x ) * 3;
-				if ( bHit )
-				{
-					pPixel[0] = pPixel[1] = pPixel[2] = rgba[0];	// grayscale visibility
-				}
-				else
-				{
-					pPixel[0] = 0x80; pPixel[1] = 0x00; pPixel[2] = 0x00;	// blue: no surface
-				}
+				pPixel[0] = 0x80; pPixel[1] = 0x00; pPixel[2] = 0x00;	// blue: open sky
 			}
 		}
-
-		if ( ( y & 63 ) == 0 )
-		{
-			Msg( "\r-sunshadowmask: %d%%   ", ( y * 100 ) / nRes );
-			fflush( stdout );
-		}
 	}
+
+	free( pDepthF );
+	free( pVisF );
 
 	// Write "<source>.sunshadow" next to the BSP.
 	char szName[1024];
