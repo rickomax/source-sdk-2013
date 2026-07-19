@@ -61,30 +61,51 @@ extern void TestLine_DoesHitSky( FourVectors const& start, FourVectors const& st
 	fltx4 *pFractionVisible, bool canRecurse, int static_prop_to_skip, bool bDoDebug );
 
 //-----------------------------------------------------------------------------
-// Trace a single column ray and return the distance to the first non-sky hit,
-// or -1 if the column only sees sky / empty space.
+// Trace a column ray (from near the sun, along the sun direction) and return
+// the distance to the first SOLID surface, or -1 if the column only sees sky /
+// empty space.
+//
+// The column starts at the sun-facing extreme of the world, which on an outdoor
+// map is above the skybox -- so the nearest hit is usually a sky brush. Sky is
+// not a shadow-casting surface, so step past each sky hit and keep going until
+// a non-sky surface (the ground/props) is found. Without this every column over
+// the skybox interior reports "no surface" and the whole mask comes out empty.
 //-----------------------------------------------------------------------------
 static float TraceColumnFirstHit( const Vector &vStart, const Vector &vDir, float flMaxLen )
 {
-	FourRays rays;
-	FourVectors start4;
-	start4.DuplicateVector( vStart );
-	FourVectors dir4;
-	dir4.DuplicateVector( vDir );
-	rays.origin = start4;
-	rays.direction = dir4;
+	Vector vOrigin = vStart;
+	float flTravelled = 0.0f;
 
-	RayTracingResult result;
-	g_RtEnv.Trace4Rays( rays, Four_Zeros, ReplicateX4( flMaxLen ), &result, TRACE_ID_STATICPROP, NULL );
+	for ( int iter = 0; iter < 16; ++iter )	// bound the sky layers we punch through
+	{
+		FourRays rays;
+		FourVectors o4;	o4.DuplicateVector( vOrigin );
+		FourVectors d4;	d4.DuplicateVector( vDir );
+		rays.origin = o4;
+		rays.direction = d4;
 
-	if ( result.HitIds[0] == -1 )
-		return -1.0f;
+		float flRemaining = flMaxLen - flTravelled;
+		if ( flRemaining <= 0.0f )
+			return -1.0f;
 
-	int nTriID = g_RtEnv.OptimizedTriangleList[ result.HitIds[0] ].m_Data.m_IntersectData.m_nTriangleID;
-	if ( nTriID & TRACE_ID_SKY )
-		return -1.0f;	// nearest thing is the sky -- no shadow-casting surface here
+		RayTracingResult result;
+		g_RtEnv.Trace4Rays( rays, Four_Zeros, ReplicateX4( flRemaining ), &result, TRACE_ID_STATICPROP, NULL );
 
-	return SubFloat( result.HitDistance, 0 );
+		if ( result.HitIds[0] == -1 )
+			return -1.0f;	// nothing more along this column
+
+		float flHit = SubFloat( result.HitDistance, 0 );
+		int nTriID = g_RtEnv.OptimizedTriangleList[ result.HitIds[0] ].m_Data.m_IntersectData.m_nTriangleID;
+		if ( !( nTriID & TRACE_ID_SKY ) )
+			return flTravelled + flHit;	// first solid surface
+
+		// It's the sky boundary -- advance just past it and continue.
+		float flAdvance = flHit + 1.0f;
+		vOrigin += vDir * flAdvance;
+		flTravelled += flAdvance;
+	}
+
+	return -1.0f;
 }
 
 //-----------------------------------------------------------------------------
